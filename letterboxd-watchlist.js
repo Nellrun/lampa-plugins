@@ -1,5 +1,5 @@
-/* letterboxd-watchlist-noloading.js — плагин без Lampa.Plugin.loading (ES5)
-   Работает с воркером: { user, count, items:[ { tmdb_id, title, year, poster, backdrop, vote_average } ] }
+/* letterboxd-watchlist-v307.js — совместимо с Lampa 3.0.7, без меню и без loading
+   Ест JSON с воркера: { user, count, items:[ { tmdb_id,title,year,poster,backdrop,vote_average } ] }
 */
 (function () {
   'use strict';
@@ -10,7 +10,7 @@
   var LANG   = 'ru-RU';
   var REGION = 'RU';
 
-  // ---------- утилиты ----------
+  // --------- утилиты ----------
   function httpGet(url, ok, fail) {
     try {
       var xhr = new XMLHttpRequest();
@@ -24,181 +24,135 @@
       xhr.send(null);
     } catch (e) { fail && fail(e); }
   }
+  function noty(msg){ try{ Lampa.Noty.show(msg); }catch(_){} }
 
-  function safeFollow(obj, evt, handler) {
-    try {
-      if (!obj) return false;
-      if (obj.listener && typeof obj.listener.follow === 'function') { obj.listener.follow(evt, handler); return true; }
-      if (typeof obj.follow === 'function') { obj.follow(evt, handler); return true; }
-      if (typeof obj.on === 'function')     { obj.on(evt, handler);     return true; }
-      if (typeof obj.listen === 'function') { obj.listen(evt, handler); return true; }
-    } catch (_) {}
-    return false;
-  }
+  // --------- карточки ----------
+  function cardFromTemplate(item){
+    try{
+      // если в этой версии есть шаблонизатор карточек — используем его
+      if (Lampa.Template && typeof Lampa.Template.get === 'function'){
+        var data = {
+          title: item.title,
+          release_year: item.year || '',
+          poster: item.poster,
+          backdrop_path: item.backdrop || '',
+          vote_average: item.vote_average || 0
+        };
+        var el = $(Lampa.Template.get('card', data));
+        el.addClass('selector focusable');
 
-  function noty(msg) {
-    try { Lampa.Noty.show(msg); } catch (_) {}
-  }
-
-  // ---------- карточки ----------
-  function buildCard(item) {
-    var card = $('<div class="card selector focusable"></div>');
-    var view = $('<div class="card__view"></div>');
-    var img  = $('<img class="card__img">');
-    if (item.poster) img.attr('src', item.poster);
-    view.append(img);
-    card.append(view);
-
-    var title = item.title || 'Без названия';
-    var year  = item.year ? ' (' + item.year + ')' : '';
-    var caption = $('<div class="card__title"></div>').text(title + year);
-    card.append(caption);
-
-    card.on('hover:enter', function () {
-      try {
-        Lampa.Activity.push({
-          title: title,
-          url: '',
-          component: 'full',
-          id: item.tmdb_id,
-          method: 'movie'
+        el.on('hover:enter', function(){
+          try {
+            Lampa.Activity.push({ title: item.title, url: '', component: 'full', id: item.tmdb_id, method: 'movie' });
+          } catch(e){ noty('Не открыть карточку: ' + e.message); }
         });
-      } catch (e) { noty('Не удалось открыть карточку: ' + e.message); }
-    });
-
-    return card;
+        return el;
+      }
+    }catch(_){}
+    return null;
   }
-
-  function buildLine(title, results) {
-    var wrap = $('<div class="items-line"></div>');
-    var head = $('<div class="items-line__title"></div>').text(title);
-    var body = $('<div class="items-line__body"></div>');
-    wrap.append(head).append(body);
-    for (var i = 0; i < results.length; i++) body.append(buildCard(results[i]));
+  function cardFallback(item){
+    var el = $('<div class="card selector focusable" style="width:140px;margin:8px;"></div>');
+    var v  = $('<div class="card__view" style="position:relative;width:100%;padding-top:150%;background:#222;border-radius:8px;overflow:hidden;"></div>');
+    if (item.poster){
+      v.css('background-image','url(' + item.poster + ')')
+       .css('background-size','cover')
+       .css('background-position','center');
+    }
+    var t = $('<div class="card__title" style="margin-top:6px;font-size:13px;line-height:1.3;"></div>')
+      .text((item.title||'Без названия') + (item.year ? ' ('+item.year+')' : ''));
+    el.append(v).append(t);
+    el.on('hover:enter', function(){
+      try{
+        Lampa.Activity.push({ title: item.title, url: '', component: 'full', id: item.tmdb_id, method: 'movie' });
+      }catch(e){ noty('Не открыть карточку: ' + e.message); }
+    });
+    return el;
+  }
+  function buildGrid(items){
+    var wrap = $('<div class="lb-grid" style="display:flex;flex-wrap:wrap;gap:4px;"></div>');
+    for (var i=0;i<items.length;i++){
+      var it = items[i];
+      var el = cardFromTemplate(it) || cardFallback(it);
+      wrap.append(el);
+    }
     return wrap;
   }
 
-  // ---------- экран ----------
-  function runScreen() {
-    var html = $(
-      '<div class="letterboxd-screen">' +
-        '<div class="layer--top">' +
-          '<div class="head"><div class="head__title">Letterboxd Watchlist</div></div>' +
-        '</div>' +
-        '<div class="content"></div>' +
-      '</div>'
-    );
+  // --------- экран ----------
+  function runScreen(){
+    // Только контент. Никаких .layer--top и самодельных хэдов, чтобы верстку не уводить.
+    var box   = $('<div class="letterboxd-box"></div>');
+    var scrollWrap = new Lampa.Scroll({ mask: true });
+    var status = $('<div style="padding:16px;opacity:.85;">Загрузка…</div>');
 
-    var body = html.find('.content');
-    // без Lampa.Plugin.loading — делаем свой статус
-    var status = $('<div class="letterboxd__status" style="padding:16px;opacity:.8;">Загрузка…</div>');
-    body.append(status);
+    scrollWrap.render().addClass('scroll--padding');
+    scrollWrap.append(status);
+    box.append(scrollWrap.render());
+
+    // Попробуем корректно встроиться в активити
+    var pushed = false;
+    try{
+      Lampa.Activity.push({ title: 'Letterboxd Watchlist', component: 'empty', url: '', id: 'lb_watchlist_v307' });
+      Lampa.Activity.active().render().append(box);
+      pushed = true;
+    }catch(_){
+      // запасной вариант: воткнем в body, чтобы хоть что-то увидеть
+      try{ $('body').append(box); }catch(__){}
+    }
 
     // Контроллер
-    try {
+    try{
       Lampa.Controller.add('lb_watchlist_ctrl', {
-        toggle: function () {
-          Lampa.Controller.collectionSet(body, html);
-          Lampa.Controller.collectionFocus(false, html);
+        toggle: function(){
+          Lampa.Controller.collectionSet(scrollWrap.render(), box);
+          Lampa.Controller.collectionFocus(false, box);
         },
-        back: function () { try { Lampa.Activity.backward(); } catch (_) {} },
-        up:   function () { Lampa.Controller.move('up'); },
-        down: function () { Lampa.Controller.move('down'); },
-        left: function () { Lampa.Controller.move('left'); },
-        right:function () { Lampa.Controller.move('right'); },
-        enter:function () { Lampa.Controller.click(); }
+        back: function(){ try{ Lampa.Activity.backward(); }catch(_){ /* ок */ } },
+        up:   function(){ Lampa.Controller.move('up'); },
+        down: function(){ Lampa.Controller.move('down'); },
+        left: function(){ Lampa.Controller.move('left'); },
+        right:function(){ Lampa.Controller.move('right'); },
+        enter:function(){ Lampa.Controller.click(); }
       });
+      Lampa.Controller.toggle('lb_watchlist_ctrl');
+    }catch(_){}
 
-      safeFollow(Lampa.Activity, 'back', function (e) {
-        if (e && e.target === html[0]) Lampa.Controller.toggle('content');
-      });
-    } catch (_) {}
+    // Дёргаем воркер
+    var url = WORKER_URL + '/?user=' + encodeURIComponent(LETTERBOXD_USER)
+            + '&pages=' + encodeURIComponent(PAGES)
+            + '&lang='  + encodeURIComponent(LANG)
+            + '&region='+ encodeURIComponent(REGION);
 
-    var url =
-      WORKER_URL + '/?user=' + encodeURIComponent(LETTERBOXD_USER) +
-      '&pages=' + encodeURIComponent(PAGES) +
-      '&lang=' + encodeURIComponent(LANG) +
-      '&region=' + encodeURIComponent(REGION);
-
-    httpGet(url, function (text) {
+    httpGet(url, function(text){
       var data;
-      try { data = JSON.parse(text); }
-      catch (e) { status.text('Letterboxd: неверный JSON'); return; }
+      try{ data = JSON.parse(text); }catch(e){ status.text('Letterboxd: неверный JSON'); return; }
 
       var items = (data && data.items) ? data.items : [];
-      if (!items.length) status.text('Letterboxd: пусто');
+      if (!items.length) { status.text('Letterboxd: пусто'); return; }
 
-      var results = [];
-      for (var i = 0; i < items.length; i++) {
-        results.push({
-          tmdb_id: items[i].tmdb_id,
-          title: items[i].title,
-          year:  items[i].year,
-          poster: items[i].poster,
-          backdrop: items[i].backdrop,
-          vote_average: items[i].vote_average
-        });
-      }
-
-      var line = buildLine('Рекомендации из Letterboxd', results);
+      var grid = buildGrid(items);
       status.remove();
-      body.append(line);
+      scrollWrap.append(grid);
+      scrollWrap.update();
 
-      try { Lampa.Controller.toggle('lb_watchlist_ctrl'); } catch (_) {}
-    }, function (err) {
+    }, function(err){
       status.text('Letterboxd: сеть/доступ. ' + (err && err.message ? err.message : 'Ошибка'));
     });
-
-    // Активити и вставка в DOM
-    try {
-      Lampa.Activity.push({ title: 'Letterboxd Watchlist', component: 'empty', url: '', id: 'lb_watchlist_activity' });
-      Lampa.Activity.active().render().append(html);
-      Lampa.Controller.toggle('lb_watchlist_ctrl');
-    } catch (e) {
-      // если Activity отсутствует — просто попытаемся вставить в body страницы
-      try { $('body').append(html); } catch (_) {}
-    }
   }
 
-  function installMenuOrOpen() {
-    var hadBuild = safeFollow(Lampa.Menu, 'build', function (e) {
-      try {
-        var item = $(
-          '<li class="menu__item selector focusable" data-action="lb_watchlist">' +
-            '<div class="menu__ico icon"><svg><use xlink:href="#icon-star"></use></svg></div>' +
-            '<div class="menu__text">Letterboxd Watchlist</div>' +
-          '</li>'
-        );
-        if (e && e.menu && e.menu.recently) e.menu.recently.append(item);
-        else if (e && e.menu && e.menu.main) e.menu.main.append(item);
-      } catch (_) {}
-    });
-
-    var hadSelect = safeFollow(Lampa.Menu, 'select', function (e) {
-      if (e && e.action === 'lb_watchlist') runScreen();
-    });
-
-    if (!hadBuild || !hadSelect) {
-      noty('Letterboxd: меню недоступно, открываю экран напрямую');
-      runScreen();
-    }
-  }
-
+  // Запускаем сразу при загрузке скрипта
   try {
-    if (Lampa.Plugin && typeof Lampa.Plugin.create === 'function') {
-      Lampa.Plugin.create({
-        title: 'Letterboxd Watchlist',
-        id: 'letterboxd_watchlist_noloading',
-        description: 'Рекомендует фильмы из Letterboxd Watchlist',
-        version: '1.0.3',
-        run: function () { installMenuOrOpen(); },
-        destroy: function () {}
-      });
+    if (Lampa && Lampa.Ready && typeof Lampa.Ready.listen === 'function'){
+      // некоторые сборки имеют «готово» событие
+      Lampa.Ready.listen('app', function(){ runScreen(); });
     } else {
-      installMenuOrOpen();
+      // просто попробуем через короткую задержку, чтобы ядро успело подняться
+      setTimeout(runScreen, 300);
     }
   } catch (e) {
+    // совсем плохо? ну хоть скажем
     noty('Letterboxd плагин: ' + e.message);
-    try { runScreen(); } catch (_) {}
+    setTimeout(runScreen, 300);
   }
 })();
