@@ -7,7 +7,7 @@
 (function(){
   'use strict';
 
-  var WORKER_URL = 'https://nellrun.workers.dev'; // <-- ПОМЕНЯЙ
+  var WORKER_URL = 'https://lbox-proxy.nellrun.workers.dev';
   var LETTERBOXD_USER = 'Nellrun';
   var PAGES  = 3;
   var LANG   = 'ru-RU';
