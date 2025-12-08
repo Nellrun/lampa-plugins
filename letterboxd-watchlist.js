@@ -1,16 +1,16 @@
-/* letterboxd-watchlist-compat.js — максимально совместимый плагин для Lampa (ES5)
-   Работает с твоим воркером: { user, count, items:[ { tmdb_id, title, year, poster, backdrop, vote_average } ] }
+/* letterboxd-watchlist-noloading.js — плагин без Lampa.Plugin.loading (ES5)
+   Работает с воркером: { user, count, items:[ { tmdb_id, title, year, poster, backdrop, vote_average } ] }
 */
 (function () {
   'use strict';
 
-  var WORKER_URL = 'https://nellrun.workers.dev';
+  var WORKER_URL = 'https://nellrun.workers.dev'; // <-- ПОМЕНЯЙ
   var LETTERBOXD_USER = 'Nellrun';
   var PAGES  = 3;
   var LANG   = 'ru-RU';
   var REGION = 'RU';
 
-  // ----------------- Утилиты -----------------
+  // ---------- утилиты ----------
   function httpGet(url, ok, fail) {
     try {
       var xhr = new XMLHttpRequest();
@@ -25,21 +25,22 @@
     } catch (e) { fail && fail(e); }
   }
 
-  function safeFollow(obj, method, evt, handler) {
+  function safeFollow(obj, evt, handler) {
     try {
       if (!obj) return false;
-      if (obj.listener && typeof obj.listener.follow === 'function') {
-        obj.listener.follow(evt, handler);
-        return true;
-      }
+      if (obj.listener && typeof obj.listener.follow === 'function') { obj.listener.follow(evt, handler); return true; }
       if (typeof obj.follow === 'function') { obj.follow(evt, handler); return true; }
       if (typeof obj.on === 'function')     { obj.on(evt, handler);     return true; }
-      // некоторые сборки держат listen()
-      if (typeof obj.listen === 'function') { obj.listen(evt, handler);  return true; }
-    } catch (e) {}
+      if (typeof obj.listen === 'function') { obj.listen(evt, handler); return true; }
+    } catch (_) {}
     return false;
   }
 
+  function noty(msg) {
+    try { Lampa.Noty.show(msg); } catch (_) {}
+  }
+
+  // ---------- карточки ----------
   function buildCard(item) {
     var card = $('<div class="card selector focusable"></div>');
     var view = $('<div class="card__view"></div>');
@@ -62,9 +63,7 @@
           id: item.tmdb_id,
           method: 'movie'
         });
-      } catch (e) {
-        try { Lampa.Noty.show('Не удалось открыть карточку: ' + e.message); } catch (_) {}
-      }
+      } catch (e) { noty('Не удалось открыть карточку: ' + e.message); }
     });
 
     return card;
@@ -75,11 +74,11 @@
     var head = $('<div class="items-line__title"></div>').text(title);
     var body = $('<div class="items-line__body"></div>');
     wrap.append(head).append(body);
-
     for (var i = 0; i < results.length; i++) body.append(buildCard(results[i]));
     return wrap;
   }
 
+  // ---------- экран ----------
   function runScreen() {
     var html = $(
       '<div class="letterboxd-screen">' +
@@ -91,31 +90,29 @@
     );
 
     var body = html.find('.content');
-    var scroll = new Lampa.Scroll({ mask: true });
-    scroll.render().addClass('scroll--padding').appendTo(body);
+    // без Lampa.Plugin.loading — делаем свой статус
+    var status = $('<div class="letterboxd__status" style="padding:16px;opacity:.8;">Загрузка…</div>');
+    body.append(status);
 
-    // Контроллер — без подписок на .listener, чтобы ничего не падало
-    Lampa.Controller.add('lb_watchlist_ctrl', {
-      toggle: function () {
-        Lampa.Controller.collectionSet(scroll.render(), html);
-        Lampa.Controller.collectionFocus(false, html);
-      },
-      back: function () { try { Lampa.Activity.backward(); } catch (_) {} },
-      up:   function () { Lampa.Controller.move('up'); },
-      down: function () { Lampa.Controller.move('down'); },
-      left: function () { Lampa.Controller.move('left'); },
-      right:function () { Lampa.Controller.move('right'); },
-      enter:function () { Lampa.Controller.click(); }
-    });
-
+    // Контроллер
     try {
-      // если событие "back" есть — подключимся, если нет — просто игнор
-      safeFollow(Lampa.Activity, 'listener', 'back', function (e) {
+      Lampa.Controller.add('lb_watchlist_ctrl', {
+        toggle: function () {
+          Lampa.Controller.collectionSet(body, html);
+          Lampa.Controller.collectionFocus(false, html);
+        },
+        back: function () { try { Lampa.Activity.backward(); } catch (_) {} },
+        up:   function () { Lampa.Controller.move('up'); },
+        down: function () { Lampa.Controller.move('down'); },
+        left: function () { Lampa.Controller.move('left'); },
+        right:function () { Lampa.Controller.move('right'); },
+        enter:function () { Lampa.Controller.click(); }
+      });
+
+      safeFollow(Lampa.Activity, 'back', function (e) {
         if (e && e.target === html[0]) Lampa.Controller.toggle('content');
       });
     } catch (_) {}
-
-    Lampa.Plugin.loading(true);
 
     var url =
       WORKER_URL + '/?user=' + encodeURIComponent(LETTERBOXD_USER) +
@@ -124,13 +121,12 @@
       '&region=' + encodeURIComponent(REGION);
 
     httpGet(url, function (text) {
-      Lampa.Plugin.loading(false);
       var data;
       try { data = JSON.parse(text); }
-      catch (e) { try { Lampa.Noty.show('Letterboxd: неверный JSON'); } catch (_) {} return; }
+      catch (e) { status.text('Letterboxd: неверный JSON'); return; }
 
       var items = (data && data.items) ? data.items : [];
-      if (!items.length) { try { Lampa.Noty.show('Letterboxd: пусто'); } catch (_) {} }
+      if (!items.length) status.text('Letterboxd: пусто');
 
       var results = [];
       for (var i = 0; i < items.length; i++) {
@@ -145,27 +141,27 @@
       }
 
       var line = buildLine('Рекомендации из Letterboxd', results);
-      scroll.append(line);
-      scroll.update();
+      status.remove();
+      body.append(line);
 
-      Lampa.Controller.toggle('lb_watchlist_ctrl');
+      try { Lampa.Controller.toggle('lb_watchlist_ctrl'); } catch (_) {}
     }, function (err) {
-      Lampa.Plugin.loading(false);
-      try { Lampa.Noty.show('Letterboxd: сеть/доступ. ' + (err && err.message ? err.message : 'Ошибка')); } catch (_) {}
+      status.text('Letterboxd: сеть/доступ. ' + (err && err.message ? err.message : 'Ошибка'));
     });
 
-    // Регистрируем активити и втыкаем экран
+    // Активити и вставка в DOM
     try {
       Lampa.Activity.push({ title: 'Letterboxd Watchlist', component: 'empty', url: '', id: 'lb_watchlist_activity' });
       Lampa.Activity.active().render().append(html);
       Lampa.Controller.toggle('lb_watchlist_ctrl');
     } catch (e) {
-      try { Lampa.Noty.show('Letterboxd: не удалось открыть экран: ' + e.message); } catch (_) {}
+      // если Activity отсутствует — просто попытаемся вставить в body страницы
+      try { $('body').append(html); } catch (_) {}
     }
   }
 
   function installMenuOrOpen() {
-    var okBuild = safeFollow(Lampa.Menu, 'listener', 'build', function (e) {
+    var hadBuild = safeFollow(Lampa.Menu, 'build', function (e) {
       try {
         var item = $(
           '<li class="menu__item selector focusable" data-action="lb_watchlist">' +
@@ -178,35 +174,31 @@
       } catch (_) {}
     });
 
-    var okSelect = safeFollow(Lampa.Menu, 'listener', 'select', function (e) {
+    var hadSelect = safeFollow(Lampa.Menu, 'select', function (e) {
       if (e && e.action === 'lb_watchlist') runScreen();
     });
 
-    if (!okBuild || !okSelect) {
-      // Меню-событий нет — просто откроем экран прямо сейчас
-      try { Lampa.Noty.show('Letterboxd: меню недоступно, открываю экран напрямую'); } catch (_) {}
+    if (!hadBuild || !hadSelect) {
+      noty('Letterboxd: меню недоступно, открываю экран напрямую');
       runScreen();
     }
   }
 
   try {
-    // Если есть Plugin.create — используем
     if (Lampa.Plugin && typeof Lampa.Plugin.create === 'function') {
       Lampa.Plugin.create({
         title: 'Letterboxd Watchlist',
-        id: 'letterboxd_watchlist_compat',
+        id: 'letterboxd_watchlist_noloading',
         description: 'Рекомендует фильмы из Letterboxd Watchlist',
-        version: '1.0.2',
+        version: '1.0.3',
         run: function () { installMenuOrOpen(); },
         destroy: function () {}
       });
     } else {
-      // Иначе сразу пытаемся воткнуться в меню или открыть экран
       installMenuOrOpen();
     }
   } catch (e) {
-    try { Lampa.Noty.show('Letterboxd плагин: ' + e.message); } catch (_) {}
-    // Последний шанс — просто открыть
+    noty('Letterboxd плагин: ' + e.message);
     try { runScreen(); } catch (_) {}
   }
 })();
