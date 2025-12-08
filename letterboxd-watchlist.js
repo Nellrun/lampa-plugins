@@ -1,336 +1,299 @@
-// letterboxd-watchlist.js (v6, Optimization & Lag fix)
 (function () {
-  'use strict';
+    'use strict';
 
-  const BLOCK_ID = 'lb-items-line';
-  const CFG_KEY = 'lb_watchlist_cfg_v4';
-  const DEF_CFG = {
-    user: '',
-    pages: 1,
-    worker: 'https://lbox-proxy.nellrun.workers.dev'
-  };
-
-  const $ = (sel, root = document) => root.querySelector(sel);
-  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-
-  function getCfg() {
-    try { return { ...DEF_CFG, ...(JSON.parse(localStorage.getItem(CFG_KEY)) || {}) }; }
-    catch { return { ...DEF_CFG }; }
-  }
-  function setCfg(patch) {
-    const next = { ...getCfg(), ...patch };
-    localStorage.setItem(CFG_KEY, JSON.stringify(next));
-    return next;
-  }
-
-  // --- CSS ---
-  function ensureStyles() {
-    if ($('#lb-watchlist-styles')) return;
-    const style = document.createElement('style');
-    style.id = 'lb-watchlist-styles';
-    style.textContent = `
-      /* Принудительная высота, чтобы фокус не перепрыгивал */
-      #${BLOCK_ID} .scroll__body { min-height: 14rem; display: flex; align-items: flex-start; }
-      
-      #${BLOCK_ID} .items-line__title { display:flex; align-items:center; gap:.75rem; }
-      #${BLOCK_ID} .lb-action .card__view { display: flex; align-items: center; justify-content: center; background: #2a2d2f; border-radius: 10px; }
-      #${BLOCK_ID} .lb-action .card__img { width: 40px; height: 40px; object-fit: contain; opacity: 0.7; padding: 0; margin: auto; display: block; }
-      #${BLOCK_ID} .card.lb-error .card__title { color:#ff6b6b; }
-      
-      /* Модальное окно */
-      .lb-modal { position:fixed; inset:0; background:rgba(0,0,0,.65); display:flex; align-items:center; justify-content:center; z-index:9999; backdrop-filter: blur(5px); }
-      .lb-modal__win { background:#1f2224; color:#fff; width:min(90vw,480px); border-radius:16px; padding:24px; box-shadow:0 10px 40px rgba(0,0,0,.6); border: 1px solid rgba(255,255,255,0.05); }
-      .lb-modal__title { font-size:20px; margin-bottom:20px; font-weight: 600; }
-      .lb-row { display:flex; flex-direction: column; gap:8px; margin-bottom: 16px; }
-      .lb-row label { opacity:.7; font-size: 14px; margin-left: 4px; }
-      .lb-input, .lb-select { width: 100%; background:#2a2d2f; border:2px solid transparent; border-radius:12px; color:#fff; padding:12px 14px; outline:none; font-size: 16px; transition: border-color .2s; box-sizing: border-box; }
-      .lb-input:focus, .lb-select:focus { border-color: #2f81f7; background: #181a1b; }
-      .lb-actionsbar { display:flex; justify-content:flex-end; gap:12px; margin-top:24px; }
-      .lb-btn2 { background:#2f81f7; border:none; border-radius:10px; padding:12px 20px; color:#fff; cursor:pointer; font-weight: 600; }
-      .lb-btn2:hover { filter: brightness(1.1); }
-      .lb-btn2--ghost { background:transparent; border: 2px solid #3a3d40; }
-      .lb-hint { font-size:13px; opacity:.5; text-align: center; margin-top: 10px; }
-    `;
-    document.head.appendChild(style);
-  }
-
-  // --- Core ---
-
-  function isHome() {
-    // Проверка через Lampa API надежнее
-    if (window.Lampa && Lampa.Activity) {
-        return Lampa.Activity.active()?.component === 'main';
-    }
-    // Фолбек для старых версий
-    const head = $('.head__title')?.textContent?.trim()?.toLowerCase() || '';
-    return head.startsWith('home') || head.startsWith('главная');
-  }
-
-  function findHomeScrollBody() {
-    // Ищем контейнер именно в активной вкладке
-    const active = $('.activity--active');
-    if (active) return $('.scroll__body', active);
-    return $('.scroll__body'); // fallback
-  }
-
-  function buildBlock() {
-    ensureStyles();
-    const host = findHomeScrollBody();
-    if (!host) return null;
-
-    // Если блок уже есть, не трогаем его
-    if ($('#' + BLOCK_ID)) return $('#' + BLOCK_ID);
-
-    const block = document.createElement('div');
-    block.className = 'items-line layer--visible layer--render items-line--type-default';
-    block.id = BLOCK_ID;
+    // ID для сохранения настроек и идентификации линии
+    const STORAGE_KEY = 'lb_watchlist_cfg_native';
+    const BLOCK_ID = 'lb-native-line';
     
-    block.innerHTML = `
-      <div class="items-line__head">
-        <div class="items-line__title">Letterboxd Watchlist</div>
-      </div>
-      <div class="items-line__body">
-        <div class="scroll scroll--horizontal">
-          <div class="scroll__content">
-            <div class="scroll__body mapping--line"></div>
-          </div>
-        </div>
-      </div>
-    `;
-
-    // Вставка: ищем место после первой нативной линии
-    const firstLine = [...host.children].find(el => el.classList.contains('items-line'));
-    if (firstLine) firstLine.insertAdjacentElement('afterend', block);
-    else host.appendChild(block);
-
-    // СРАЗУ рисуем заглушку, чтобы блок имел высоту и селектор
-    const cfg = getCfg();
-    if (!cfg.user) renderActionCard(block, 'settings', 'Требуется настройка', 'Нажмите для ввода ника');
-    else reload(block);
-
-    return block;
-  }
-
-  // --- Logic ---
-
-  async function fetchJson(url) {
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(r.status);
-    return r.json();
-  }
-
-  let loading = false;
-
-  async function reload(block) {
-    if (!block) block = $('#' + BLOCK_ID);
-    if (!block) return;
-
-    const cfg = getCfg();
-    if (!cfg.user) return; // Оставляем карточку настроек
-
-    if (loading) return;
-    loading = true;
-
-    // Рисуем "Загрузку" сразу. Это важно, чтобы селектор не пропадал.
-    renderActionCard(block, 'broadcast', 'Загрузка...', 'Получение списка');
-
-    try {
-        let items = [];
-        const workerUrl = cfg.worker || DEF_CFG.worker;
-        
-        if (cfg.pages > 1) {
-            const promises = [];
-            for (let p = 1; p <= cfg.pages; p++) {
-                promises.push(fetchJson(`${workerUrl}/?user=${encodeURIComponent(cfg.user)}&page=${p}`).catch(()=>({items:[]})));
-            }
-            const results = await Promise.all(promises);
-            results.forEach(r => {
-                 const arr = Array.isArray(r?.items) ? r.items : (Array.isArray(r) ? r : []);
-                 items.push(...arr);
-            });
-        } else {
-            const j = await fetchJson(`${workerUrl}/?user=${encodeURIComponent(cfg.user)}&pages=1`);
-            items = Array.isArray(j?.items) ? j.items : (Array.isArray(j) ? j : []);
-        }
-
-        const norm = normalizeItems(items);
-        if (!norm.length) renderActionCard(block, 'empty', 'Список пуст', 'Проверьте ник на Letterboxd');
-        else renderCards(block, norm);
-
-    } catch (e) {
-        console.error(e);
-        renderActionCard(block, 'warning', 'Ошибка', 'Не удалось загрузить');
-    } finally {
-        loading = false;
-    }
-  }
-
-  function normalizeItems(items) {
-    const out = []; const seen = new Set();
-    for (const it of items) {
-      const tmdb = it.tmdb_id ?? it.tmdbId ?? it.tmdb ?? null;
-      const title = it.title ?? it.name ?? '';
-      const year = it.year ?? it.release_year ?? it.releaseYear ?? '';
-      let poster = it.poster ?? it.poster_path ?? it.posterPath ?? '';
-      if (poster && poster.startsWith('/')) poster = 'https://image.tmdb.org/t/p/w300' + poster;
-      
-      const key = tmdb ? String(tmdb) : title + '|' + year;
-      if (seen.has(key)) continue; seen.add(key);
-      out.push({ tmdb, title, year, poster });
-    }
-    return out;
-  }
-
-  // --- Rendering ---
-
-  // Создаем карточки фильмов
-  function renderCards(block, items) {
-    const body = block.querySelector('.scroll__body');
-    if (!body) return;
-    body.innerHTML = ''; // Очищаем заглушку
-
-    const frag = document.createDocumentFragment();
-
-    items.forEach(it => {
-      const card = document.createElement('div');
-      // Классы Lampa: selector - обязателен для фокуса
-      card.className = 'card selector layer--visible layer--render card--loaded';
-      card.style.width = '12rem'; // Чуть фиксируем ширину для красоты
-      
-      card.innerHTML = `
-        <div class="card__view">
-          <img src="${it.poster || './img/img_load.svg'}" class="card__img" 
-               onload="this.style.opacity=1" onerror="this.src='./img/img_broken.svg'">
-           ${it.tmdb ? '<div class="card__vote">TMDB</div>' : ''}
-        </div>
-        <div class="card__title">${escapeHtml(it.title)}</div>
-        <div class="card__age">${escapeHtml(String(it.year))}</div>
-      `;
-
-      card.addEventListener('click', () => {
-          if (it.tmdb && window.Lampa) {
-              Lampa.Activity.push({ url: 'movie/' + it.tmdb, title: it.title, component: 'full', id: it.tmdb, method: 'movie', card: it });
-          }
-      });
-      // Долгое нажатие - настройки
-      card.addEventListener('contextmenu', (e) => { e.preventDefault(); openSettings(block); });
-
-      frag.appendChild(card);
-    });
-    body.appendChild(frag);
-  }
-
-  // Создаем служебную карточку (Load/Error/Settings)
-  function renderActionCard(block, iconName, title, subtitle) {
-    const body = block.querySelector('.scroll__body');
-    if (!body) return;
-    body.innerHTML = '';
-
-    const card = document.createElement('div');
-    card.className = 'card selector layer--visible layer--render card--loaded lb-action';
-    card.style.width = '12rem';
-    
-    // Используем встроенные иконки Lampa (если путь ./img/icons/... доступен)
-    // Либо SVG инлайном, чтобы наверняка
-    const iconPath = `./img/icons/menu/${iconName}.svg`; 
-    
-    card.innerHTML = `
-        <div class="card__view">
-            <img src="${iconPath}" class="card__img" onerror="this.style.display='none'">
-        </div>
-        <div class="card__title">${title}</div>
-        <div class="card__age">${subtitle}</div>
-    `;
-
-    card.addEventListener('click', () => {
-        if (iconName === 'settings') openSettings(block);
-        else reload(block);
-    });
-
-    body.appendChild(card);
-  }
-
-  // --- Settings Modal ---
-
-  function openSettings(block) {
-    const cfg = getCfg();
-    const modal = document.createElement('div');
-    modal.className = 'lb-modal';
-    
-    // Используем input type="text" без лишних обработчиков, чтобы не лагало
-    modal.innerHTML = `
-      <div class="lb-modal__win">
-        <div class="lb-modal__title">Настройки Letterboxd</div>
-        
-        <div class="lb-row">
-          <label>Имя пользователя (Letterboxd)</label>
-          <input id="lb-user" class="lb-input" type="text" value="${escapeAttr(cfg.user)}" placeholder="Никнейм">
-        </div>
-        
-        <div class="lb-row">
-          <label>Количество страниц загрузки</label>
-          <select id="lb-pages" class="lb-select">
-            ${[1,2,3,4,5].map(n => `<option value="${n}" ${n===Number(cfg.pages)?'selected':''}>${n}</option>`).join('')}
-          </select>
-        </div>
-
-        <div class="lb-actionsbar">
-          <button class="lb-btn2 lb-btn2--ghost" data-act="cancel">Отмена</button>
-          <button class="lb-btn2" data-act="save">Сохранить</button>
-        </div>
-        <div class="lb-hint">Удерживайте ОК на фильме, чтобы открыть это меню</div>
-      </div>
-    `;
-
-    document.body.appendChild(modal);
-    
-    // Фокус на поле ввода
-    setTimeout(() => { const inp = modal.querySelector('input'); if(inp) inp.focus(); }, 100);
-
-    const close = () => modal.remove();
-    
-    modal.onclick = (e) => { if (e.target === modal) close(); };
-    modal.querySelector('[data-act="cancel"]').onclick = close;
-    modal.querySelector('[data-act="save"]').onclick = () => {
-      const user = $('#lb-user', modal).value.trim();
-      const pages = Number($('#lb-pages', modal).value) || 1;
-      setCfg({ user, pages });
-      close();
-      reload(block);
+    // Настройки по умолчанию
+    const DEFAULTS = {
+        user: '',
+        pages: 1,
+        worker: 'https://lbox-proxy.nellrun.workers.dev'
     };
-  }
 
-  function escapeHtml(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-  function escapeAttr(s) { return String(s || '').replace(/"/g,'&quot;'); }
+    // Хелпер для работы с настройками
+    const Settings = {
+        get: () => Object.assign({}, DEFAULTS, Lampa.Storage.get(STORAGE_KEY, '{}')),
+        set: (data) => Lampa.Storage.set(STORAGE_KEY, data)
+    };
 
-  // --- Initialization (Lag Free) ---
+    // --- Основной класс плагина ---
+    function LBPlugin() {
+        let component = null;
+        let line = null;
 
-  function startPlugin() {
-      // 1. Первая попытка рендера
-      if (isHome()) buildBlock();
+        // Точка входа: запускаем только когда Lampa готова
+        this.init = function () {
+            if (window.lb_plugin_inited) return;
+            window.lb_plugin_inited = true;
 
-      // 2. Слушаем события Lampa (Правильный способ без обсерверов)
-      if (window.Lampa && Lampa.Listener) {
-          Lampa.Listener.follow('activity', (e) => {
-              if (e.type === 'active' && e.component === 'main') {
-                  // Небольшая задержка, чтобы DOM успел построиться
-                  setTimeout(buildBlock, 50);
-              }
-          });
-      }
+            // Слушаем смену экранов (Activities)
+            Lampa.Listener.follow('activity', (e) => {
+                if (e.type === 'active' && e.component === 'main') {
+                    component = e.object; // Ссылка на объект главной страницы
+                    this.injectLine();
+                }
+            });
 
-      // 3. Редкий фоллбек на случай, если события не сработали (раз в 2 сек)
-      // Это не грузит процессор в отличие от MutationObserver
-      setInterval(() => {
-          if (isHome() && !$('#' + BLOCK_ID)) buildBlock();
-      }, 2000);
-  }
+            // На случай если плагин загрузился после старта (инъекция на лету)
+            if (Lampa.Activity.active() && Lampa.Activity.active().component === 'main') {
+                component = Lampa.Activity.active().object;
+                this.injectLine();
+            }
+        };
 
-  if (window.Lampa) {
-      if (Lampa.Listener) startPlugin();
-      else document.addEventListener('DOMContentLoaded', startPlugin);
-  } else {
-      setTimeout(startPlugin, 1000);
-  }
+        this.injectLine = function () {
+            // Если линия уже есть в DOM, не дублируем
+            if ($('#' + BLOCK_ID).length) return;
+
+            // Находим контейнер главной страницы
+            const scroll_body = component.render().find('.scroll__body').first();
+            if (!scroll_body.length) return;
+
+            // Создаем структуру линии через встроенный шаблон Lampa
+            // Это создает div с классом items-line и правильной структурой
+            const body = Lampa.Template.get('items_line', {
+                title: 'Letterboxd Watchlist'
+            });
+            
+            body.attr('id', BLOCK_ID);
+            
+            // Ссылка на контейнер карточек внутри линии
+            line = body.find('.scroll__body');
+            
+            // Чтобы фокус не пролетал, задаем минимальную высоту, пока грузимся
+            line.css('min-height', '19em'); 
+
+            // Вставляем линию после "Меню" или первой линии, но до подвала
+            // Обычно в Lampa вставляют в конец scroll_body
+            scroll_body.append(body);
+
+            this.loadContent();
+        };
+
+        this.loadContent = function () {
+            const cfg = Settings.get();
+
+            // 1. Если нет юзера - показываем карточку настройки
+            if (!cfg.user) {
+                this.renderActionCard('settings', 'Настроить', 'Укажите ник Letterboxd');
+                return;
+            }
+
+            // 2. Показываем карточку загрузки (чтобы фокус мог встать на неё)
+            this.renderActionCard('broadcast', 'Загрузка...', 'Получение списка');
+
+            // 3. Грузим данные
+            this.fetchData(cfg)
+                .then(items => {
+                    line.empty(); // Очищаем "Загрузку"
+                    
+                    if (!items || items.length === 0) {
+                        this.renderActionCard('empty', 'Пусто', 'Список пуст или закрыт');
+                        return;
+                    }
+
+                    // Рендерим фильмы
+                    items.forEach(item => {
+                        // Создаем нативную карточку Lampa
+                        // Lampa.Card сама обработает клик, longpress и фокус
+                        const card = new Lampa.Card(item, {
+                            card_small: true, // или false, если нужны большие
+                            object: item      // передаем объект для Context Menu
+                        });
+
+                        card.create(); // Генерирует DOM
+
+                        // Добавляем обработчик долгого нажатия для настроек
+                        card.render().on('contextmenu', (e) => {
+                            e.preventDefault();
+                            this.openSettings();
+                        });
+
+                        line.append(card.render());
+                    });
+                    
+                    // Сообщаем контроллеру Lampa, что контент изменился
+                    if(Lampa.Controller.enabled().name === 'content') {
+                        // Это помогает пересчитать навигацию
+                        Lampa.Controller.toggle('content'); 
+                    }
+                })
+                .catch(err => {
+                    console.error('LB Error', err);
+                    this.renderActionCard('error', 'Ошибка', 'Не удалось загрузить');
+                });
+        };
+
+        // Загрузка данных с воркера
+        this.fetchData = async function (cfg) {
+            let allItems = [];
+            const worker = cfg.worker || DEFAULTS.worker;
+            
+            // Функция-хелпер для fetch
+            const getPage = async (p) => {
+                const url = `${worker}/?user=${encodeURIComponent(cfg.user)}&page=${p}`;
+                const res = await fetch(url);
+                if (!res.ok) throw new Error('Network error');
+                return res.json();
+            };
+
+            // Логика страниц
+            if (cfg.pages > 1) {
+                const promises = [];
+                for (let i = 1; i <= cfg.pages; i++) promises.push(getPage(i).catch(()=>({items:[]})));
+                const results = await Promise.all(promises);
+                results.forEach(r => {
+                    const list = r.items || r || [];
+                    if(Array.isArray(list)) allItems.push(...list);
+                });
+            } else {
+                const res = await getPage(1);
+                allItems = res.items || res || [];
+            }
+
+            // Превращаем JSON Letterboxd в объект, понятный Lampa (TMDB format)
+            return this.normalize(allItems);
+        };
+
+        // Маппинг данных в формат Lampa
+        this.normalize = function (items) {
+            const result = [];
+            const seen = new Set();
+
+            items.forEach(it => {
+                // Пытаемся найти ID
+                const tmdb_id = it.tmdb_id || it.tmdbId || it.tmdb;
+                const title = it.title || it.name;
+                const year = it.year || it.release_year || '0000';
+                
+                // Уникальность
+                const key = tmdb_id ? 'id_'+tmdb_id : 't_'+title;
+                if(seen.has(key)) return;
+                seen.add(key);
+
+                // Формируем объект Lampa Movie
+                // Важно: 'source: tmdb' заставляет Лампу саму искать ссылки и описание
+                const obj = {
+                    id: tmdb_id,
+                    title: title,
+                    original_title: title, // Фолбек
+                    release_date: year + '-01-01',
+                    poster_path: it.poster || it.poster_path,
+                    vote_average: 0, // Можно парсить рейтинг если есть
+                    source: 'tmdb',  // Говорим Лампе, что это TMDB контент
+                    project: 'letterboxd' // Метка
+                };
+                
+                // Если постера нет или он кривой, фиксим
+                if(obj.poster_path && !obj.poster_path.startsWith('http') && !obj.poster_path.startsWith('/')) {
+                     // если там base64 или что-то странное, пропускаем
+                } else if (obj.poster_path && obj.poster_path.startsWith('/')) {
+                    obj.poster_path = 'https://image.tmdb.org/t/p/w300' + obj.poster_path;
+                }
+                
+                // Если нет TMDB ID, карточка будет "глупой" (только поиск), 
+                // если есть - она откроет полную информацию.
+                if(!tmdb_id) obj.source = ''; // Снимаем флаг источника, чтобы открылся поиск
+
+                result.push(obj);
+            });
+            return result;
+        };
+
+        // Рендер служебных карточек (Настройки, Ошибка)
+        this.renderActionCard = function (action, title, desc) {
+            line.empty();
+            
+            // Создаем фейковый объект фильма для карточки
+            const item = {
+                title: title,
+                release_date: desc,
+                poster_path: '', // Нет постера
+                id: -1
+            };
+
+            const card = new Lampa.Card(item, {
+                card_small: true
+            });
+            card.create();
+
+            // Переопределяем внешний вид под "кнопку"
+            const img_div = card.render().find('.card__view');
+            img_div.css({
+                background: '#2b2d31',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+            });
+            
+            // Иконка
+            let icon = '';
+            if(action === 'settings') icon = '<svg width="40" height="40" viewBox="0 0 24 24" fill="white" fill-opacity="0.5"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>';
+            else if(action === 'broadcast') icon = '<svg width="40" height="40" viewBox="0 0 24 24" fill="white" fill-opacity="0.5"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z"/></svg>'; // play-ish
+            else icon = '<svg width="40" height="40" viewBox="0 0 24 24" fill="white" fill-opacity="0.5"><path d="M11 15h2v2h-2zm0-8h2v6h-2zm1-5C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>';
+
+            img_div.html(icon);
+
+            // Клик по служебной карточке
+            card.render().on('click', () => {
+                if (action === 'settings') this.openSettings();
+                else this.loadContent(); // ретрай
+            });
+
+            line.append(card.render());
+        };
+
+        // Окно настроек (используем нативные инпуты Lampa если возможно, но проще свой модал)
+        this.openSettings = function () {
+            const cfg = Settings.get();
+            
+            // Используем Lampa.Interaction.input (нативная клавиатура) для ввода ника?
+            // Это решит проблему с вводом на ТВ и ПК.
+            
+            Lampa.Input.edit({
+                title: 'Letterboxd Username',
+                value: cfg.user,
+                free: true,
+                nosave: true
+            }, (new_user) => {
+                // Сохраняем юзера
+                Settings.set({ ...cfg, user: new_user });
+                
+                // Спрашиваем количество страниц
+                Lampa.Select.show({
+                    title: 'Количество страниц',
+                    items: [
+                        { title: '1 страница', value: 1 },
+                        { title: '2 страницы', value: 2 },
+                        { title: '3 страницы', value: 3 },
+                        { title: '5 страниц', value: 5 }
+                    ],
+                    onSelect: (a) => {
+                        Settings.set({ ...Settings.get(), pages: a.value });
+                        Lampa.Controller.toggle('content'); // возвращаем фокус
+                        this.loadContent(); // Перезагружаем линию
+                    },
+                    onBack: () => {
+                        Lampa.Controller.toggle('content');
+                    }
+                });
+            });
+        };
+    }
+
+    // Запуск
+    if (window.Lampa && window.Lampa.Listener) {
+        new LBPlugin().init();
+    } else {
+        // Ждем загрузки Lampa
+        let waiter = setInterval(() => {
+            if (window.Lampa && window.Lampa.Listener) {
+                clearInterval(waiter);
+                new LBPlugin().init();
+            }
+        }, 300);
+    }
 
 })();
