@@ -90,10 +90,8 @@
       grid.style.display = 'none';
       status.textContent = 'Загрузка…';
 
-      var url = WORKER_URL + '/?user=' + encodeURIComponent(LETTERBOXD_USER) +
-                '&pages=' + encodeURIComponent(PAGES) +
-                '&lang=' + encodeURIComponent(LANG) +
-                '&region=' + encodeURIComponent(REGION);
+      var url = WORKER_URL + '/?user=' + encodeURIComponent(LETTERBOXD_USER)
+          + '&pages=' + encodeURIComponent(PAGES);
 
       httpGet(url, function (text) {
         var data;
