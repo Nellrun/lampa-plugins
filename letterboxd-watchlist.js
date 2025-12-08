@@ -1,184 +1,130 @@
-/* letterboxd-home-line.js — аккуратная строка "Letterboxd Watchlist" на Home (ES5)
-   — Вставляется ПЕРВОЙ перед остальными rows .items-line
-   — Использует те же классы, что и Лампа: items-line, items-line__title, items-line__body, card...
-   — Кнопка "Обновить" дергает &refresh=1 (пробой кэша на воркере)
-*/
 (function () {
-  'use strict';
+  // настройки
+  const USER = 'Nellrun';
+  const MAX_PAGES = 3;
+  const WORKER = 'https://lbox-proxy.nellrun.workers.dev/';
 
-  var WORKER_URL = 'https://lbox-proxy.nellrun.workers.dev';
-  var LETTERBOXD_USER = 'Nellrun';
-  var PAGES = 3;
+  const rootSel = '.activity__body .scroll__body';
 
-  // -------- utils --------
-  function httpGet(url, ok, fail) {
-    try {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', url, true);
-      xhr.onreadystatechange = function () {
-        if (xhr.readyState === 4) {
-          if (xhr.status >= 200 && xhr.status < 300) ok(xhr.responseText);
-          else fail && fail({ status: xhr.status, body: xhr.responseText || '' });
-        }
-      };
-      xhr.send(null);
-    } catch (e) { fail && fail({ status: 0, body: String(e && e.message || e) }); }
-  }
-  function ensureStyles(){
-    if (document.getElementById('lb-line-styles')) return;
-    var css =
-      '.lb-refresh{margin-left:12px; display:inline-block; padding:3px 8px; border-radius:8px; background:#2b2b2b; color:#fff; font-size:12px; opacity:.9; cursor:pointer}' +
-      '.lb-status{padding:8px 4px; opacity:.8}';
-    var st = document.createElement('style'); st.id = 'lb-line-styles'; st.textContent = css; document.head.appendChild(st);
-  }
+  function ensureRow() {
+    const root = document.querySelector(rootSel);
+    if (!root) return null;
 
-  // -------- cards --------
-  function buildCard(it) {
-    // пробуем шаблон Лампы для карточек
-    try {
-      if (Lampa.Template && typeof Lampa.Template.get === 'function') {
-        var data = {
-          title: it.title,
-          release_year: it.year || '',
-          poster: it.poster,
-          backdrop_path: it.backdrop || '',
-          vote_average: it.vote_average || 0
-        };
-        var el = $(Lampa.Template.get('card', data));
-        el.addClass('selector focusable');
-        el.on('hover:enter', function () {
-          try {
-            Lampa.Activity.push({ title: it.title, url: '', component: 'full', id: it.tmdb_id, method: 'movie' });
-          } catch (e) {
-            try { window.open('https://www.themoviedb.org/movie/' + it.tmdb_id, '_blank'); } catch (_) {}
-          }
-        });
-        return el[0];
-      }
-    } catch (_){}
-
-    // fallback карточка (совместимо со старым WebView)
-    var card = document.createElement('div');
-    card.className = 'card selector focusable';
-    var view = document.createElement('div'); view.className = 'card__view';
-    var img = document.createElement('img'); img.className = 'card__img';
-    if (it.poster) img.src = it.poster;
-    view.appendChild(img);
-    var caption = document.createElement('div'); caption.className = 'card__title';
-    caption.textContent = (it.title || 'Без названия') + (it.year ? ' (' + it.year + ')' : '');
-    card.appendChild(view); card.appendChild(caption);
-
-    (function (item) {
-      function openFull() {
-        try { Lampa.Activity.push({ title: item.title, url: '', component: 'full', id: item.tmdb_id, method: 'movie' }); }
-        catch (e) { try { window.open('https://www.themoviedb.org/movie/' + item.tmdb_id, '_blank'); } catch (_) {} }
-      }
-      card.addEventListener('click', openFull);
-      if (window.$) $(card).on('hover:enter', openFull);
-    })(it);
-
-    return card;
-  }
-
-  // -------- line --------
-  function createLine() {
-    ensureStyles();
-
-    var line = document.createElement('div');
-    line.className = 'items-line';
-    line.id = 'lb-items-line';
-
-    var head = document.createElement('div');
-    head.className = 'items-line__title';
-    head.textContent = 'Letterboxd Watchlist';
-
-    var refresh = document.createElement('span');
-    refresh.className = 'lb-refresh';
-    refresh.textContent = 'Обновить';
-    refresh.onclick = function(){ loadInto(line, true); };
-
-    head.appendChild(refresh);
-
-    var body = document.createElement('div');
-    body.className = 'items-line__body';
-
-    var status = document.createElement('div');
-    status.className = 'lb-status';
-    status.textContent = 'Загрузка…';
-
-    line.appendChild(head);
-    line.appendChild(status);
-    line.appendChild(body);
-
-    return line;
-  }
-
-  function loadInto(line, force) {
-    var status = line.querySelector('.lb-status');
-    var body = line.querySelector('.items-line__body');
-    status.style.display = '';
-    body.style.display = 'none';
-    status.textContent = 'Загрузка…';
-
-    var url = WORKER_URL + '/?user=' + encodeURIComponent(LETTERBOXD_USER) +
-              '&pages=' + encodeURIComponent(PAGES) +
-              (force ? '&refresh=1&_=' + Date.now() : '');
-
-    httpGet(url, function (text) {
-      var data; try { data = JSON.parse(text); } catch(e){ status.textContent = 'Неверный JSON'; return; }
-      var items = data && data.items ? data.items : [];
-      if (!items.length) { status.textContent = 'Пусто'; return; }
-
-      body.innerHTML = '';
-      for (var i = 0; i < items.length; i++) body.appendChild(buildCard(items[i]));
-      status.style.display = 'none';
-      body.style.display = '';
-    }, function (err) {
-      var msg = 'HTTP ' + (err && err.status || '');
-      var hint = '';
-      try { hint = JSON.parse(err.body).error; } catch(_) { hint = err && err.body || ''; }
-      status.innerHTML = 'Сеть/доступ: ' + msg + (hint ? '<br>' + String(hint) : '');
-    });
-  }
-
-  // -------- inject before first items-line --------
-  function findLinesContainer() {
-    // находим первую строку и вставляем перед ней — так не наползает на верхнюю панель
-    var firstLine = document.querySelector('.items-line');
-    if (firstLine && firstLine.parentElement) return { parent: firstLine.parentElement, before: firstLine };
-    // fallback: основной контент
-    var content = document.querySelector('.content');
-    return content ? { parent: content, before: content.firstChild } : { parent: document.body, before: null };
-  }
-
-  function injectOnce() {
-    if (document.getElementById('lb-items-line')) return true;
-    var spot = findLinesContainer();
-    if (!spot || !spot.parent) return false;
-
-    var line = createLine();
-    try { spot.parent.insertBefore(line, spot.before || null); }
-    catch (_) { spot.parent.appendChild(line); }
-
-    loadInto(line, false);
-    return true;
-  }
-
-  function boot() {
-    var ok = injectOnce();
-    if (!ok) {
-      var tries = 0;
-      var iv = setInterval(function(){
-        if (injectOnce() || ++tries > 30) clearInterval(iv);
-      }, 200);
+    let line = document.getElementById('lb-items-line');
+    if (!line) {
+      line = document.createElement('div');
+      line.id = 'lb-items-line';
+      line.className = 'items-line';
+      line.innerHTML = `
+        <div class="items-line__head">
+          <div class="items-line__title">Letterboxd Watchlist
+            <span class="lb-refresh" style="margin-left:.75rem;opacity:.7;cursor:pointer">Обновить</span>
+          </div>
+        </div>
+        <div class="items-line__body">
+          <div class="scroll scroll--horizontal">
+            <div class="scroll__content"><div class="scroll__body mapping--line"></div></div>
+          </div>
+        </div>`;
     }
-    try {
-      var mo = new MutationObserver(function(){
-        if (!document.getElementById('lb-items-line')) injectOnce();
-      });
-      mo.observe(document.body, { childList:true, subtree:true });
-    } catch(_) {}
+    const first = root.querySelector('.items-line');
+    if (line !== first) root.insertBefore(line, first || root.firstChild);
+    return line.querySelector('.mapping--line');
   }
 
-  setTimeout(boot, 500);
+  function tmdbImg(path) {
+    return path ? 'https://image.tmdb.org/t/p/w300' + path : './img/img_broken.svg';
+  }
+
+  function normalize(raw) {
+    const r = raw.tmdb || raw;
+    return {
+      id: r.id,
+      type: r.type || (r.media_type === 'tv' ? 'tv' : 'movie'),
+      title: r.title || r.name,
+      year: r.year || (r.release_date || r.first_air_date || '').slice(0,4),
+      poster: r.poster || r.poster_path,
+      vote: r.vote || r.vote_average
+    };
+  }
+
+  function cardHTML(item) {
+    const vote = item.vote ? `<div class="card__vote">${(+item.vote).toFixed(1).replace(/\.0$/,'')}</div>` : '';
+    const tv   = item.type === 'tv' ? `<div class="card__type">TV</div>` : '';
+    return `
+      <div class="card selector layer--visible layer--render ${item.type==='tv'?'card--tv':''}" data-id="${item.id}" data-type="${item.type}">
+        <div class="card__view">
+          <img class="card__img" src="${tmdbImg(item.poster)}">
+          <div class="card__icons"><div class="card__icons-inner"></div></div>
+          ${tv}${vote}
+        </div>
+        <div class="card__title">${item.title || ''}</div>
+        <div class="card__age">${item.year || ''}</div>
+      </div>`;
+  }
+
+  async function loadPages() {
+    // воркер с параметром pages глючит на 2–3 страницах — идём поштучно
+    const all = [];
+    for (let p = 1; p <= MAX_PAGES; p++) {
+      const url = `${WORKER}?user=${encodeURIComponent(USER)}&page=${p}`;
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+      all.push(...items);
+    }
+    return all.map(normalize);
+  }
+
+  async function render() {
+    const mount = ensureRow();
+    if (!mount) return;
+
+    mount.innerHTML = '<div style="padding:8px;opacity:.7">Загрузка…</div>';
+    try {
+      const items = await loadPages();
+      mount.innerHTML = items.map(cardHTML).join('');
+      // дать лампе шанс «приклеить» фокус/прокрутку
+      try { Lampa.Images && Lampa.Images.lazy && Lampa.Images.lazy(); } catch(_) {}
+    } catch (e) {
+      mount.innerHTML = '<div style="padding:8px;color:#f66">Ошибка загрузки</div>';
+      console.error('LB plug-in error', e);
+    }
+  }
+
+  // клики по карточкам: открываем фулл из TMDB
+  document.addEventListener('click', (e) => {
+    const r = e.target.closest('#lb-items-line .card.selector');
+    if (!r) {
+      if (e.target.closest('#lb-items-line .lb-refresh')) render();
+      return;
+    }
+    const id   = r.getAttribute('data-id');
+    const type = r.getAttribute('data-type') === 'tv' ? 'tv' : 'movie';
+    try {
+      Lampa.Activity.push({ component: 'full', id, method: type, source: 'tmdb' });
+    } catch (_) {}
+  });
+
+  // ждём, пока отрисуется Home, и монтируемся на самый верх
+  let tries = 0;
+  const iv = setInterval(() => {
+    const onHome = document.querySelector('.head__title')?.textContent?.includes('Home');
+    const root   = document.querySelector(rootSel);
+    if (onHome && root) { clearInterval(iv); render(); }
+    if (++tries > 40) clearInterval(iv);
+  }, 250);
+
+  // если Lampa перерисовала экран — пересадим ряд обратно наверх
+  try {
+    new MutationObserver(() => {
+      const root = document.querySelector(rootSel);
+      const line = document.getElementById('lb-items-line');
+      if (root && line && line.parentNode !== root) {
+        const first = root.querySelector('.items-line');
+        root.insertBefore(line, first || root.firstChild);
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  } catch (_) {}
 })();
