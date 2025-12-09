@@ -1,273 +1,464 @@
 (function () {
     'use strict';
 
-    // --- CONFIG ---
-    var STORAGE_KEY = 'lb_watchlist_v10';
-    var CONFIG_KEY = 'lb_config_v10';
     var network = new Lampa.Reguest();
 
-    var defaults = {
-        user: '',
-        pages: 1,
+    // === STORAGE KEYS & DEFAULTS ===
+    const S_KEYS = {
+        MOVIES: 'letterboxd_movies',
+        USER:   'letterboxd_user',
+        PAGES:  'letterboxd_pages',
+        WORKER: 'letterboxd_worker',
+        FIRST:  'letterboxd_launched_before'
+    };
+
+    const DEFAULTS = {
+        user:   '',
+        pages:  1,
         worker: 'https://lbox-proxy.nellrun.workers.dev'
     };
 
-    function getConfig() {
-        return Object.assign({}, defaults, Lampa.Storage.get(CONFIG_KEY, '{}'));
+    // === UTIL ===
+    function readJSON(key, fallback) {
+        try {
+            const raw = Lampa.Storage.get(key, null);
+            if (Array.isArray(raw)) return raw; // на всякий
+            if (typeof raw === 'string') return JSON.parse(raw);
+            return fallback;
+        } catch {
+            return fallback;
+        }
     }
 
-    function setConfig(newConf) {
-        Lampa.Storage.set(CONFIG_KEY, newConf);
+    function writeJSON(key, value) {
+        try { Lampa.Storage.set(key, JSON.stringify(value)); }
+        catch { Lampa.Storage.set(key, value); }
     }
 
-    // --- LOGIC ---
+    function tmdbBase() {
+        // используем tmdb.* из манифеста Lampa
+        return Lampa.Utils.protocol() + 'tmdb.' + Lampa.Manifest.cub_domain + '/3';
+    }
 
-    // Основная функция загрузки
-    function loadData(callback_success, callback_error) {
-        var cfg = getConfig();
-        if (!cfg.user) {
-            if (callback_error) callback_error({ type: 'empty', msg: 'Никнейм не указан' });
+    function todayISO() {
+        const d = new Date();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${d.getFullYear()}-${m}-${day}`;
+    }
+
+    // Нормализация объектов из воркера
+    function normalizeWorkerItems(resp) {
+        const arr = Array.isArray(resp?.items) ? resp.items : (Array.isArray(resp) ? resp : []);
+        const out = [];
+        const seen = new Set();
+        for (const it of arr) {
+            const tmdb = it.tmdb_id ?? it.tmdb ?? it.id_tmdb ?? null;
+            const imdb = it.imdb_id ?? it.imdb ?? null;
+            const title = it.title ?? it.name ?? '';
+            const year = it.year ?? it.release_year ?? it.first_air_date?.slice(0,4) ?? it.release_date?.slice(0,4) ?? '';
+            const media_type = it.media_type ?? it.type ?? null; // 'movie' | 'tv' | null
+            const key = tmdb ? 'tmdb:' + tmdb : `t:${title}|y:${year}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push({ tmdb, imdb, title, year, media_type });
+        }
+        return out;
+    }
+
+    // Получаем Letterboxd данные через воркер
+    function fetchLetterboxdBatch(user, page, worker, onDone) {
+        const url = `${worker}/?user=${encodeURIComponent(user)}&page=${encodeURIComponent(page)}`;
+        network.silent(url, function (data) {
+            onDone(null, normalizeWorkerItems(data));
+        }, function (err) {
+            onDone(err || 'error', []);
+        }, false, { type: 'get' });
+    }
+
+    async function getLetterboxdData(user, pages, worker, onProgress) {
+        // Сначала попробуем единым запросом ?pages=N
+        const tryMerged = () => new Promise((resolve) => {
+            const url = `${worker}/?user=${encodeURIComponent(user)}&pages=${encodeURIComponent(pages)}`;
+            network.silent(url, function (data) {
+                const items = normalizeWorkerItems(data);
+                // уведомим
+                onProgress && onProgress(items.length, items.length);
+                resolve(items);
+            }, function () {
+                resolve(null);
+            }, false, { type: 'get' });
+        });
+
+        const merged = await tryMerged();
+        if (merged) return merged;
+
+        // Фолбэк: постранично
+        return new Promise((resolve) => {
+            let page = 1;
+            let acc = [];
+            let total = 0;
+            let processed = 0;
+
+            const next = () => {
+                if (page > pages) {
+                    resolve(acc);
+                    return;
+                }
+                fetchLetterboxdBatch(user, page, worker, function (_err, items) {
+                    if (Array.isArray(items)) {
+                        acc = acc.concat(items);
+                        total += items.length;
+                    }
+                    processed++;
+                    onProgress && onProgress(processed, pages);
+                    page++;
+                    next();
+                });
+            };
+            next();
+        });
+    }
+
+    // Забор деталей из TMDB
+    function tmdbFetchById(id, mediaType, onDone) {
+        const base = tmdbBase();
+        const api_key = '4ef0d7355d9ffb5151e987764708ce96';
+        const url = mediaType
+            ? `${base}/${mediaType}/${id}?api_key=${api_key}&language=ru`
+            : `${base}/movie/${id}?api_key=${api_key}&language=ru`;
+
+        network.silent(url, function (data) {
+            if (data && data.id) onDone(null, data);
+            else onDone('empty', null);
+        }, function (err) {
+            onDone(err || 'error', null);
+        });
+    }
+
+    function tmdbSearchByTitle(title, year, preferTV, onDone) {
+        const base = tmdbBase();
+        const api_key = '4ef0d7355d9ffb5151e987764708ce96';
+
+        // Сначала попробуем multi
+        const qMulti = `${base}/search/multi?query=${encodeURIComponent(title)}&api_key=${api_key}&language=ru&include_adult=false${year ? `&year=${year}` : ''}`;
+        network.silent(qMulti, function (data) {
+            const pick = () => {
+                if (!data || !Array.isArray(data.results) || !data.results.length) return null;
+                // если preferTV просили, попробуем отдать tv
+                if (preferTV) {
+                    const tv = data.results.find(r => r.media_type === 'tv');
+                    if (tv) return { item: tv, type: 'tv' };
+                }
+                // иначе первый подходящий movie/tv
+                const first = data.results.find(r => r.media_type === 'movie' || r.media_type === 'tv') || data.results[0];
+                if (!first) return null;
+                const type = first.media_type === 'tv' ? 'tv' : 'movie';
+                return { item: first, type };
+            };
+            const chosen = pick();
+            if (chosen) onDone(null, chosen.item, chosen.type);
+            else onDone('not_found', null, null);
+        }, function () {
+            // Фолбэк: отдельные поиски
+            const qMovie = `${base}/search/movie?query=${encodeURIComponent(title)}&api_key=${api_key}&language=ru${year ? `&year=${year}` : ''}`;
+            network.silent(qMovie, function (md) {
+                if (md && md.results && md.results[0]) onDone(null, md.results[0], 'movie');
+                else {
+                    const qTv = `${base}/search/tv?query=${encodeURIComponent(title)}&api_key=${api_key}&language=ru${year ? `&first_air_date_year=${year}` : ''}`;
+                    network.silent(qTv, function (td) {
+                        if (td && td.results && td.results[0]) onDone(null, td.results[0], 'tv');
+                        else onDone('not_found', null, null);
+                    }, function (err) { onDone(err || 'error', null, null); });
+                }
+            }, function (err) { onDone(err || 'error', null, null); });
+        });
+    }
+
+    function dateReleased(item) {
+        const d = item.release_date || item.first_air_date;
+        if (!d) return true;
+        return d <= todayISO();
+    }
+
+    // === PIPELINE: получаем воркер → приводим к TMDB карточкам → кладём в кэш ===
+    function processLetterboxdToTMDB(user, pages, worker, done) {
+        const existing = readJSON(S_KEYS.MOVIES, []);
+        // оставим только те, что ещё в вочлисте (обновим позже)
+        const keep = [];
+        writeJSON(S_KEYS.MOVIES, keep);
+
+        getLetterboxdData(user, pages, worker, function (a, b) {
+            // a/b тут просто для логов прогресса
+        }).then(function (items) {
+            if (!items.length) {
+                writeJSON(S_KEYS.MOVIES, keep);
+                Lampa.Noty.show('Список Letterboxd пуст или закрыт');
+                return done(null, keep);
+            }
+
+            const receivedKeySet = new Set();
+            items.forEach(it => {
+                const key = it.tmdb ? 'tmdb:' + it.tmdb : `t:${it.title}|y:${it.year}`;
+                receivedKeySet.add(key);
+            });
+
+            // Сохраняем только актуальные из старого
+            const filteredOld = existing.filter(x => {
+                const key = x && x.id ? 'tmdb:' + x.id : '';
+                return key && receivedKeySet.has(key);
+            });
+
+            writeJSON(S_KEYS.MOVIES, filteredOld);
+
+            let processed = 0;
+            const total = items.length;
+            if (!total) {
+                done(null, filteredOld);
+                return;
+            }
+
+            function stepDone() {
+                processed++;
+                if (processed >= total) {
+                    const finalArr = readJSON(S_KEYS.MOVIES, []);
+                    Lampa.Noty.show('Обновление Letterboxd завершено (' + String(finalArr.length) + ')');
+                    // Первый запуск: откроем компонент
+                    if (Lampa.Storage.get(S_KEYS.FIRST, false) === false) {
+                        Lampa.Storage.set(S_KEYS.FIRST, true);
+                        Lampa.Activity.push({
+                            url: '',
+                            title: 'Letterboxd',
+                            component: 'letterboxd',
+                            page: 1
+                        });
+                    }
+                    done(null, finalArr);
+                }
+            }
+
+            items.forEach(function (it) {
+                // если уже есть карточка в кэше по tmdb id — пропускаем запрос
+                if (it.tmdb) {
+                    const have = readJSON(S_KEYS.MOVIES, []).some(m => String(m.id) === String(it.tmdb));
+                    if (have) return stepDone();
+                }
+
+                if (it.tmdb) {
+                    tmdbFetchById(it.tmdb, it.media_type, function (_e, tmdbItem) {
+                        if (tmdbItem) {
+                            if (dateReleased(tmdbItem)) {
+                                const cur = readJSON(S_KEYS.MOVIES, []);
+                                cur.unshift(tmdbItem);
+                                writeJSON(S_KEYS.MOVIES, cur);
+                            }
+                        }
+                        stepDone();
+                    });
+                } else {
+                    // нет tmdb id — ищем по названию
+                    tmdbSearchByTitle(it.title, it.year, it.media_type === 'tv', function (_e, found, type) {
+                        if (found) {
+                            if (dateReleased(found)) {
+                                const cur = readJSON(S_KEYS.MOVIES, []);
+                                cur.unshift(found);
+                                writeJSON(S_KEYS.MOVIES, cur);
+                            }
+                        }
+                        stepDone();
+                    });
+                }
+            });
+        });
+    }
+
+    // === API ДЛЯ КОМПОНЕНТА ===
+    function full(params, oncomplete, _onerror) {
+        const user   = Lampa.Storage.get(S_KEYS.USER, DEFAULTS.user);
+        const pages  = Number(Lampa.Storage.get(S_KEYS.PAGES, DEFAULTS.pages)) || 1;
+        const worker = Lampa.Storage.get(S_KEYS.WORKER, DEFAULTS.worker);
+
+        if (!user) {
+            Lampa.Noty.show('Укажите имя пользователя Letterboxd в настройках');
+            oncomplete({ secuses: true, page: 1, results: [] });
             return;
         }
 
-        var allItems = [];
-        var count = 0;
-        var maxPages = parseInt(cfg.pages) || 1;
-
-        function fetchPage(p) {
-            var url = cfg.worker + '/?user=' + encodeURIComponent(cfg.user) + '&page=' + p;
-            network.silent(url, function (data) {
-                var items = data.items || data || [];
-                if (items.length) allItems = allItems.concat(items);
-
-                count++;
-                if (count >= maxPages) finish();
-                else fetchPage(count + 1);
-            }, function (a, c) {
-                // Даже если ошибка, пробуем следующую страницу
-                count++;
-                if (count >= maxPages) finish();
-                else fetchPage(count + 1);
-            });
-        }
-
-        function finish() {
-            if (!allItems.length) {
-                if (callback_error) callback_error({ type: 'empty', msg: 'Список пуст или ошибка сети' });
-                return;
-            }
-            // Нормализация
-            var clean = normalize(allItems);
-            // Кэшируем
-            Lampa.Storage.set(STORAGE_KEY, clean);
-            if (callback_success) callback_success(clean);
-        }
-
-        fetchPage(1);
-    }
-
-    function normalize(items) {
-        var result = [];
-        var seen = {};
-        
-        items.forEach(function (it) {
-            var tmdb = it.tmdb_id || it.tmdb;
-            var title = it.title || it.name;
-            var year = it.year || it.release_year || '0000';
-            var key = tmdb ? 'id_' + tmdb : 't_' + title;
-
-            if (seen[key]) return;
-            seen[key] = true;
-
-            var poster = it.poster || it.poster_path || '';
-            if (poster && poster.indexOf('/') === 0) poster = 'https://image.tmdb.org/t/p/w300' + poster;
-
-            result.push({
-                source: 'tmdb',
-                id: tmdb,
-                title: title,
-                original_title: title,
-                release_date: year + '-01-01',
-                poster_path: poster,
-                vote_average: 0
+        processLetterboxdToTMDB(user, pages, worker, function () {
+            // отдаём что есть в кэше
+            oncomplete({
+                secuses: true,
+                page: 1,
+                results: readJSON(S_KEYS.MOVIES, [])
             });
         });
-        return result;
     }
 
-    // --- HOME PAGE INJECTION ---
-    
-    function injectRow() {
-        // Проверяем, на главной ли мы
-        var active = Lampa.Activity.active();
-        if (!active || active.component !== 'main') return;
+    function clear() { network.clear(); }
 
-        // Ищем контейнер скролла
-        var scroll_body = $('.activity--active .scroll__body');
-        if (!scroll_body.length) return;
+    var Api = { full, clear };
 
-        var ID = 'lb-row-home';
-        
-        // Если строка уже есть - обновляем контент внутри, если нужно
-        if ($('#' + ID).length) return;
-
-        // Создаем контейнер линии через Template (это важно для TV навигации)
-        var line = Lampa.Template.get('items_line', { title: 'Letterboxd Watchlist' });
-        line.attr('id', ID);
-
-        // Вставляем после первой линии (обычно меню) или в конец
-        var first = scroll_body.find('.items-line').eq(0);
-        if (first.length) first.after(line);
-        else scroll_body.append(line);
-
-        // Рендер содержимого
-        var body = line.find('.scroll__body');
-        
-        // 1. Показываем кэш СРАЗУ (чтобы не прыгало)
-        var cached = Lampa.Storage.get(STORAGE_KEY, []);
-        if (cached.length) {
-            renderCards(body, cached);
-        } else {
-            // Если кэша нет - показываем заглушку, чтобы фокус не пролетал
-            renderAction(body, 'broadcast', 'Загрузка...', 'Подождите');
-        }
-
-        // 2. Загружаем свежие данные
-        loadData(function (items) {
-            // Если мы всё еще на главной
-            if ($('#' + ID).length) {
-                renderCards(body, items);
-            }
-        }, function (err) {
-            if ($('#' + ID).length && !cached.length) {
-                if(err.type === 'empty') renderAction(body, 'empty', 'Пусто', 'Настройте плагин');
-                else renderAction(body, 'error', 'Ошибка', 'Проверьте сеть');
-            }
-        });
-    }
-
-    function renderCards(container, items) {
-        container.empty();
-        items.forEach(function (item) {
-            var card = new Lampa.Card(item, { card_small: true, object: item });
-            card.create();
-            container.append(card.render());
-        });
-        // Обновляем контроллер (фикс для навигации)
-        Lampa.Controller.toggle('content');
-    }
-
-    function renderAction(container, type, title, subtitle) {
-        container.empty();
-        var item = { id: -1, title: title, release_date: subtitle };
-        var card = new Lampa.Card(item, { card_small: true });
-        card.create();
-        card.render().find('.card__view').css({ background: '#333', display: 'flex', alignItems: 'center', justifyContent: 'center' }).html('<div style="opacity:0.5;font-size:2em">⚙️</div>');
-        container.append(card.render());
-    }
-
-    // --- COMPONENT (Для отдельной страницы) ---
-    // Это аналог того, как сделан Кинопоиск, открывается через меню
+    // === COMPONENT ===
     function component(object) {
         var comp = new Lampa.InteractionCategory(object);
         comp.create = function () {
-            this.activity.loader(true);
-            loadData(function (items) {
-                comp.build(items);
-                comp.activity.loader(false);
-            }, function (err) {
-                comp.empty();
-                comp.activity.loader(false);
-            });
+            Api.full(object, this.build.bind(this), this.empty.bind(this));
+        };
+        comp.nextPageReuest = function (object, resolve, reject) {
+            Api.full(object, resolve.bind(comp), reject.bind(comp));
         };
         return comp;
     }
 
-    // --- MENU ITEM ---
-    function addMenu() {
-        var item = $('<li class="menu__item selector"><div class="menu__ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M17 3H7c-1.1 0-1.99.9-1.99 2L5 21l7-3 7 3V5c0-1.1-.9-2-2-2z"/></svg></div><div class="menu__text">Letterboxd</div></li>');
-        item.on('hover:enter', function () {
-            Lampa.Activity.push({
-                url: '',
-                title: 'Letterboxd',
-                component: 'letterboxd',
-                page: 1
-            });
-        });
-        $('.menu .menu__list').eq(0).append(item);
-    }
-
-    // --- SETTINGS (Native) ---
-    function addSettings() {
-        Lampa.SettingsApi.addComponent({
-            component: 'letterboxd',
+    // === SETTINGS & MENU ===
+    function startPlugin() {
+        var manifest = {
+            type: 'video',
+            version: '0.4.0',
             name: 'Letterboxd',
-            icon: '<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5z"/></svg>'
-        });
+            description: 'Watchlist из Letterboxd',
+            component: 'letterboxd'
+        };
 
-        Lampa.SettingsApi.addParam({
-            component: 'letterboxd',
-            param: { name: 'lb_user', type: 'input' },
-            field: { name: 'Никнейм', description: 'Username на Letterboxd' },
-            onChange: function (val) {
-                var c = getConfig();
-                c.user = val;
-                setConfig(c);
-                // Сброс кэша
-                Lampa.Storage.set(STORAGE_KEY, []);
-                Lampa.Noty.show('Сохранено. Перезагрузите главную.');
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'letterboxd',
-            param: { name: 'lb_pages', type: 'select', values: { 1: '1', 2: '2', 3: '3', 5: '5' }, default: 1 },
-            field: { name: 'Страницы', description: 'Глубина загрузки' },
-            onChange: function (val) {
-                var c = getConfig();
-                c.pages = val;
-                setConfig(c);
-            }
-        });
-        
-        // Синхронизация полей
-        var curr = getConfig();
-        Lampa.Storage.set('lb_user', curr.user);
-        Lampa.Storage.set('lb_pages', curr.pages);
-    }
-
-    // --- START ---
-    function start() {
-        if (window.lb_plugin_v10_init) return;
-        window.lb_plugin_v10_init = true;
-
-        // 1. Регистрируем компонент (для меню)
+        Lampa.Manifest.plugins = manifest;
         Lampa.Component.add('letterboxd', component);
 
-        // 2. Добавляем настройки
-        addSettings();
+        function addMenu() {
+            var button = $(
+                `<li class="menu__item selector">
+                    <div class="menu__ico">
+                        <svg viewBox="0 0 24 24" width="239" height="239" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M4 4h16v2H4zM4 9h16v2H4zM4 14h16v2H4zM4 19h10v2H4z" />
+                        </svg>
+                    </div>
+                    <div class="menu__text">${manifest.name}</div>
+                </li>`
+            );
+            button.on('hover:enter', function () {
+                if (!Lampa.Storage.get(S_KEYS.USER, '')) {
+                    Lampa.Noty.show('Сначала задайте имя пользователя в настройках');
+                    Lampa.Controller.toggle('settings_component');
+                }
+                Lampa.Activity.push({
+                    url: '',
+                    title: manifest.name,
+                    component: 'letterboxd',
+                    page: 1
+                });
+            });
+            $('.menu .menu__list').eq(0).append(button);
+        }
 
-        // 3. Добавляем пункт в меню
-        addMenu();
+        if (window.appready) addMenu();
+        else {
+            Lampa.Listener.follow('app', function (e) {
+                if (e.type == 'ready') addMenu();
+            });
+        }
 
-        // 4. Следим за главной страницей (для строки)
-        Lampa.Listener.follow('activity', function (e) {
-            if (e.type === 'active' && e.component === 'main') {
-                setTimeout(injectRow, 100);
+        // SETTINGS
+        if (!window.lampa_settings.letterboxd) {
+            Lampa.SettingsApi.addComponent({
+                component: 'letterboxd',
+                icon: '<svg viewBox="0 0 24 24" width="239" height="239" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M4 4h16v2H4zM4 9h16v2H4zM4 14h16v2H4zM4 19h10v2H4z"/></svg>',
+                name: 'Letterboxd'
+            });
+        }
+
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: { type: 'title' },
+            field: { name: 'Параметры' }
+        });
+
+        // Имя пользователя
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: {
+                name: S_KEYS.USER,
+                type: 'input',
+                default: Lampa.Storage.get(S_KEYS.USER, DEFAULTS.user)
+            },
+            field: {
+                name: 'Имя пользователя',
+                description: 'Публичный username в Letterboxd'
+            },
+            onChange: (v) => {
+                Lampa.Storage.set(S_KEYS.USER, String(v || '').trim());
             }
         });
 
-        // Если стартанули уже на главной
-        if (Lampa.Activity.active().component === 'main') {
-            injectRow();
-        }
-    }
+        // Кол-во страниц воркера
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: {
+                name: S_KEYS.PAGES,
+                type: 'select',
+                values: [1, 2, 3, 4, 5],
+                default: Number(Lampa.Storage.get(S_KEYS.PAGES, DEFAULTS.pages)) || 1
+            },
+            field: {
+                name: 'Страниц',
+                description: 'Сколько страниц тащить из воркера'
+            },
+            onChange: (v) => {
+                Lampa.Storage.set(S_KEYS.PAGES, Number(v) || 1);
+            }
+        });
 
-    if (window.appready) start();
-    else {
-        Lampa.Listener.follow('app', function (e) {
-            if (e.type === 'ready') start();
+        // URL воркера
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: {
+                name: S_KEYS.WORKER,
+                type: 'input',
+                default: Lampa.Storage.get(S_KEYS.WORKER, DEFAULTS.worker)
+            },
+            field: {
+                name: 'URL воркера',
+                description: 'Cloudflare Worker, отдающий JSON watchlist'
+            },
+            onChange: (v) => {
+                Lampa.Storage.set(S_KEYS.WORKER, String(v || '').trim() || DEFAULTS.worker);
+            }
+        });
+
+        // Обновить сейчас
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: { type: 'button', name: 'letterboxd_refresh' },
+            field: {
+                name: 'Обновить список',
+                description: 'Забрать свежий watchlist'
+            },
+            onChange: () => {
+                const user   = Lampa.Storage.get(S_KEYS.USER, DEFAULTS.user);
+                const pages  = Number(Lampa.Storage.get(S_KEYS.PAGES, DEFAULTS.pages)) || 1;
+                const worker = Lampa.Storage.get(S_KEYS.WORKER, DEFAULTS.worker);
+                if (!user) {
+                    Lampa.Noty.show('Сначала задайте имя пользователя');
+                    return;
+                }
+                processLetterboxdToTMDB(user, pages, worker, function () {
+                    Lampa.Noty.show('Готово. Откройте раздел Letterboxd.');
+                });
+            }
+        });
+
+        // Очистить кэш
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: { type: 'button', name: 'letterboxd_delete_cache' },
+            field: {
+                name: 'Очистить кэш',
+                description: 'Если что-то сломалось или надо пересобрать список'
+            },
+            onChange: () => {
+                writeJSON(S_KEYS.MOVIES, []);
+                Lampa.Noty.show('Кэш Letterboxd очищен');
+            }
         });
     }
 
+    if (!window.letterboxd_ready) startPlugin();
 })();
