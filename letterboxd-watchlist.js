@@ -22,15 +22,13 @@
         return {
             id: item.tmdb_id,
             title: item.title || '',
-            name: item.title || '',
             original_title: item.title || '',
-            original_name: item.title || '',
             overview: item.overview || '',
             poster_path: poster,
             backdrop_path: backdrop,
             vote_average: item.vote_average || 0,
             release_date: item.year ? String(item.year) + '-01-01' : '',
-            first_air_date: item.year ? String(item.year) + '-01-01' : '',
+            media_type: 'movie',
             source: 'tmdb'
         };
     }
