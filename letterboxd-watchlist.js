@@ -12,34 +12,33 @@
         return {
             id: item.tmdb_id,
             title: item.title,
-            name: item.title, // для совместимости с TV
+            name: item.title,
             original_title: item.title,
             original_name: item.title,
-            overview: item.overview,
-            poster_path: item.poster ? item.poster.replace('https://image.tmdb.org/t/p/w500', '') : null,
-            backdrop_path: item.backdrop ? item.backdrop.replace('https://image.tmdb.org/t/p/w780', '') : null,
-            vote_average: item.vote_average,
-            release_date: item.year + '-01-01',
-            first_air_date: item.year + '-01-01',
-            media_type: 'movie',
+            overview: item.overview || '',
+            poster_path: item.poster ? item.poster.replace('https://image.tmdb.org/t/p/w500', '') : '',
+            backdrop_path: item.backdrop ? item.backdrop.replace('https://image.tmdb.org/t/p/w780', '') : '',
+            vote_average: item.vote_average || 0,
+            release_date: item.year ? item.year + '-01-01' : '',
+            first_air_date: item.year ? item.year + '-01-01' : '',
+            source: 'tmdb',
             letterboxd_slug: item.slug
         };
     }
 
     /**
-     * Получает данные watchlist из API
+     * Загружает watchlist из API и сохраняет в Storage
      */
-    function fetchWatchlist(params, oncomplete, onerror) {
+    function loadWatchlist(callback) {
         var username = Lampa.Storage.get('letterboxd_username', '');
         
         if (!username) {
-            Lampa.Noty.show('Укажите имя пользователя Letterboxd в настройках');
-            onerror();
+            console.log('Letterboxd', 'No username set');
+            if (callback) callback([]);
             return;
         }
 
-        var page = params.page || 1;
-        var url = API_BASE_URL + '?user=' + encodeURIComponent(username) + '&pages=' + page;
+        var url = API_BASE_URL + '?user=' + encodeURIComponent(username) + '&pages=1';
 
         console.log('Letterboxd', 'Fetching watchlist from:', url);
 
@@ -49,43 +48,57 @@
                 
                 console.log('Letterboxd', 'Received ' + results.length + ' movies for user: ' + data.user);
 
-                // Кэшируем данные
-                Lampa.Storage.set('letterboxd_movies', JSON.stringify(results));
+                // Сохраняем данные
+                Lampa.Storage.set('letterboxd_movies', results);
                 Lampa.Storage.set('letterboxd_movies_count', data.count);
 
-                oncomplete({
-                    results: results,
-                    total_pages: Math.ceil(data.count / data.items.length) || 1,
-                    total_results: data.count,
-                    page: page
-                });
+                Lampa.Noty.show('Letterboxd: загружено ' + results.length + ' фильмов');
+
+                if (callback) callback(results);
             } else {
                 console.log('Letterboxd', 'Invalid response:', data);
-                Lampa.Noty.show('Не удалось получить данные из Letterboxd');
-                onerror();
+                if (callback) callback([]);
             }
         }, function(error) {
             console.log('Letterboxd', 'API Error:', error);
-            
-            // Пробуем использовать кэшированные данные
-            var cached = Lampa.Storage.get('letterboxd_movies', '[]');
-            try {
-                var cachedMovies = JSON.parse(cached);
-                if (cachedMovies.length > 0) {
-                    Lampa.Noty.show('Используются кэшированные данные Letterboxd');
+            Lampa.Noty.show('Ошибка загрузки Letterboxd');
+            if (callback) callback([]);
+        });
+    }
+
+    /**
+     * API для компонента
+     */
+    function full(params, oncomplete, onerror) {
+        var username = Lampa.Storage.get('letterboxd_username', '');
+        
+        if (!username) {
+            Lampa.Noty.show('Укажите имя пользователя Letterboxd в настройках');
+            onerror();
+            return;
+        }
+
+        var movies = Lampa.Storage.get('letterboxd_movies', []);
+
+        // Если есть кэшированные данные - показываем их
+        if (movies && movies.length > 0) {
+            oncomplete({
+                results: movies,
+                page: 1
+            });
+        } else {
+            // Загружаем данные
+            loadWatchlist(function(results) {
+                if (results.length > 0) {
                     oncomplete({
-                        results: cachedMovies,
-                        total_pages: 1,
-                        total_results: cachedMovies.length,
+                        results: results,
                         page: 1
                     });
-                    return;
+                } else {
+                    onerror();
                 }
-            } catch(e) {}
-            
-            Lampa.Noty.show('Ошибка при загрузке данных из Letterboxd');
-            onerror();
-        });
+            });
+        }
     }
 
     function clear() {
@@ -93,7 +106,7 @@
     }
 
     var Api = {
-        fetch: fetchWatchlist,
+        full: full,
         clear: clear
     };
 
@@ -104,11 +117,11 @@
         var comp = new Lampa.InteractionCategory(object);
         
         comp.create = function() {
-            Api.fetch(object, this.build.bind(this), this.empty.bind(this));
+            Api.full(object, this.build.bind(this), this.empty.bind(this));
         };
         
         comp.nextPageReuest = function(object, resolve, reject) {
-            Api.fetch(object, resolve.bind(comp), reject.bind(comp));
+            Api.full(object, resolve.bind(comp), reject.bind(comp));
         };
         
         return comp;
@@ -139,8 +152,6 @@
                         <circle cx="129" cy="250" r="95" fill="#00E054"/>\
                         <circle cx="371" cy="250" r="95" fill="#40BCF4"/>\
                         <circle cx="250" cy="250" r="95" fill="#FF8000"/>\
-                        <path d="M196 175 C220 210, 220 290, 196 325" stroke="#00E054" stroke-width="8" fill="none"/>\
-                        <path d="M304 175 C280 210, 280 290, 304 325" stroke="#40BCF4" stroke-width="8" fill="none"/>\
                     </svg>\
                 </div>\
                 <div class="menu__text">' + manifest.name + '</div>\
@@ -150,8 +161,7 @@
                 var username = Lampa.Storage.get('letterboxd_username', '');
                 
                 if (!username) {
-                    Lampa.Noty.show('Укажите имя пользователя в настройках Letterboxd');
-                    Lampa.Settings.open('letterboxd');
+                    Lampa.Noty.show('Укажите имя пользователя в настройках');
                     return;
                 }
 
@@ -176,8 +186,6 @@
                     <circle cx="129" cy="250" r="95" fill="#00E054"/>\
                     <circle cx="371" cy="250" r="95" fill="#40BCF4"/>\
                     <circle cx="250" cy="250" r="95" fill="#FF8000"/>\
-                    <path d="M196 175 C220 210, 220 290, 196 325" stroke="#00E054" stroke-width="8" fill="none"/>\
-                    <path d="M304 175 C280 210, 280 290, 304 325" stroke="#40BCF4" stroke-width="8" fill="none"/>\
                 </svg>',
                 name: PLUGIN_NAME
             });
@@ -208,7 +216,7 @@
                 onChange: function(value) {
                     Lampa.Storage.set('letterboxd_username', value);
                     // Очищаем кэш при смене пользователя
-                    Lampa.Storage.set('letterboxd_movies', '[]');
+                    Lampa.Storage.set('letterboxd_movies', []);
                     Lampa.Storage.set('letterboxd_movies_count', 0);
                     console.log('Letterboxd', 'Username changed to:', value);
                 }
@@ -237,7 +245,7 @@
                     description: 'Очистить кэшированные данные о фильмах'
                 },
                 onChange: function() {
-                    Lampa.Storage.set('letterboxd_movies', '[]');
+                    Lampa.Storage.set('letterboxd_movies', []);
                     Lampa.Storage.set('letterboxd_movies_count', 0);
                     Lampa.Noty.show('Кэш Letterboxd очищен');
                 }
@@ -262,12 +270,7 @@
                     }
                     
                     Lampa.Noty.show('Загружаем список...');
-                    
-                    fetchWatchlist({ page: 1 }, function(data) {
-                        Lampa.Noty.show('Загружено фильмов: ' + data.total_results);
-                    }, function() {
-                        Lampa.Noty.show('Ошибка при загрузке');
-                    });
+                    loadWatchlist();
                 }
             });
         }
@@ -292,4 +295,3 @@
         startPlugin();
     }
 })();
-
