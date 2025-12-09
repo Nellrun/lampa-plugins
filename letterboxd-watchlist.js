@@ -1,231 +1,278 @@
-(function () {
+(function() {
     'use strict';
-
-    // --- КОНФИГУРАЦИЯ ---
-    const PLUGIN_NAME = 'Letterboxd Watchlist';
-    const BLOCK_ID = 'lb-watchlist-block-v8';
-    const STORAGE_KEY = 'lb_settings_v8';
     
-    // --- ХЕЛПЕРЫ ---
-    const Settings = {
-        get: () => Lampa.Storage.get(STORAGE_KEY, '{}'),
-        set: (v) => Lampa.Storage.set(STORAGE_KEY, v)
+    // Используем встроенный класс запросов Lampa (с сохранением опечатки Reguest, как в ядре)
+    var network = new Lampa.Reguest();
+    var STORAGE_KEY = 'lb_watchlist_cache';
+    var CONFIG_KEY = 'lb_config';
+
+    // Конфигурация по умолчанию
+    var defaults = {
+        user: '',
+        pages: 1,
+        worker: 'https://lbox-proxy.nellrun.workers.dev'
     };
 
-    // --- ОСНОВНАЯ ЛОГИКА ---
-    function startPlugin() {
-        // Проверка на дубликаты
-        if (window.lb_plugin_v8_inited) return;
-        window.lb_plugin_v8_inited = true;
+    function getConfig() {
+        var stored = Lampa.Storage.get(CONFIG_KEY, '{}');
+        return Object.assign({}, defaults, stored);
+    }
 
-        // 1. Уведомление о старте (чтобы вы поняли, что плагин вообще загрузился)
-        Lampa.Noty.show('Letterboxd Plugin: Loaded');
-        console.log('[LB] Plugin started');
+    // --- ЛОГИКА ЗАГРУЗКИ ---
 
-        // 2. Запускаем "монитор", который следит за наличием линии на главной
-        // Это самый надежный способ на ТВ, чтобы не зависеть от событий
-        setInterval(monitor, 2000);
+    function getWatchlist() {
+        var cfg = getConfig();
+        if (!cfg.user) return;
+
+        // 1. Сначала отображаем то, что есть в кэше (чтобы линия появилась мгновенно)
+        var cached = Lampa.Storage.get(STORAGE_KEY, []);
+        if (cached.length) {
+            renderLine(cached);
+        }
+
+        // 2. Фоновое обновление данных
+        console.log('Letterboxd', 'Start updating watchlist for user:', cfg.user);
         
-        // Первая проверка сразу
-        monitor();
-    }
+        var allItems = [];
+        var count = 0;
+        var maxPages = cfg.pages || 1;
 
-    function monitor() {
-        // Проверяем, активна ли сейчас "Главная" (component: 'main')
-        const active = Lampa.Activity.active();
-        if (!active || active.component !== 'main') return;
-
-        // Проверяем, есть ли уже наша линия в DOM
-        // Используем Lampa.jQuery для надежности
-        const $ = Lampa.jQuery;
-        if ($('#' + BLOCK_ID).length > 0) return;
-
-        // Если главной нет, или линии нет - пытаемся внедрить
-        inject($);
-    }
-
-    function inject($) {
-        console.log('[LB] Trying to inject...');
-        
-        // Ищем контейнер скролла на активной странице
-        // В Lampa 3+ это обычно .activity--active .scroll__body
-        const scrollBody = $('.activity--active .scroll__body').first();
-
-        if (!scrollBody.length) {
-            console.log('[LB] Scroll body not found');
-            return;
-        }
-
-        // Создаем контейнер линии
-        // Важно: используем стандартный темплейт Lampa
-        const line_outer = Lampa.Template.get('items_line', { title: 'Letterboxd Watchlist' });
-        line_outer.attr('id', BLOCK_ID);
-
-        // Вставляем линию. 
-        // Логика: Вставить ПОСЛЕ первой найденной линии (обычно это "Сейчас смотрят" или меню)
-        const firstLine = scrollBody.find('.items-line').first();
-        if (firstLine.length) {
-            firstLine.after(line_outer);
-        } else {
-            scrollBody.append(line_outer);
-        }
-
-        // Рендерим содержимое
-        renderContent(line_outer.find('.scroll__body'), $);
-    }
-
-    function renderContent(container, $) {
-        // Сразу задаем высоту, чтобы фокус не пролетал мимо
-        container.css({ 'min-height': '180px' }); 
-        container.empty();
-
-        const cfg = Settings.get();
-
-        // 1. Если нет настроек - кнопка настройки
-        if (!cfg.user) {
-            createButton(container, 'settings', 'Настроить', 'Введите никнейм');
-            return;
-        }
-
-        // 2. Кнопка загрузки
-        createButton(container, 'broadcast', 'Загрузка...', 'Подождите');
-
-        // 3. Запрос данных
-        loadData(cfg).then(items => {
-            // Если контейнера уже нет (ушли со страницы) - стоп
-            if (!container.closest('body').length) return;
+        function fetchPage(page) {
+            var url = cfg.worker + '/?user=' + encodeURIComponent(cfg.user) + '&page=' + page;
             
-            container.empty();
+            network.silent(url, function(data) {
+                // Успех
+                var items = data.items || data || [];
+                if (items.length) {
+                    allItems = allItems.concat(items);
+                }
 
-            if (!items.length) {
-                createButton(container, 'empty', 'Пусто', 'Список пуст');
-                return;
-            }
-
-            // Рендер фильмов
-            items.forEach(item => {
-                const card = new Lampa.Card(item, {
-                    card_small: true,
-                    object: item
-                });
-                card.create();
-                
-                // Долгое нажатие - настройки
-                card.render().on('contextmenu', (e) => {
-                    e.preventDefault();
-                    openSettings();
-                });
-
-                container.append(card.render());
+                count++;
+                if (count >= maxPages) {
+                    processData(allItems);
+                } else {
+                    fetchPage(count + 1);
+                }
+            }, function(err) {
+                // Ошибка
+                console.log('Letterboxd', 'Error loading page ' + page, err);
+                count++;
+                if (count >= maxPages && allItems.length) processData(allItems);
             });
+        }
 
-            // Обновляем контроллер, чтобы он увидел новые карточки
-            Lampa.Controller.toggle('content');
-
-        }).catch(err => {
-            console.error('[LB]', err);
-            container.empty();
-            createButton(container, 'error', 'Ошибка', 'Нажмите для повтора');
-        });
+        fetchPage(1);
     }
 
-    // Создание системной кнопки (Настройки/Ошибка) через Lampa.Card
-    function createButton(container, type, title, subtitle) {
-        const item = { id: -1, title: title, release_date: subtitle };
-        const card = new Lampa.Card(item, { card_small: true });
-        card.create();
+    function processData(rawItems) {
+        if (!rawItems || !rawItems.length) return;
 
-        // Кастомизация вида
-        const view = card.render().find('.card__view');
-        view.css({ background: '#222', display: 'flex', alignItems: 'center', justifyContent: 'center' });
-        
-        let icon = '';
-        if (type === 'settings') icon = '<svg style="width:40px;height:40px;fill:white;opacity:0.5" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>';
-        if (type === 'broadcast') icon = '<svg style="width:40px;height:40px;fill:white;opacity:0.5" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z"/></svg>';
-        if (type === 'error') icon = '<svg style="width:40px;height:40px;fill:#f55;opacity:0.8" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>';
-        
-        view.html(icon || '');
+        console.log('Letterboxd', 'Received items:', rawItems.length);
 
-        card.render().on('click', () => {
-            if (type === 'settings') openSettings();
-            else {
-                const $ = Lampa.jQuery;
-                renderContent(container, $);
-            }
-        });
+        // Нормализация данных под формат Lampa
+        var cleanItems = [];
+        var seen = new Set();
 
-        container.append(card.render());
-    }
-
-    async function loadData(cfg) {
-        const worker = 'https://lbox-proxy.nellrun.workers.dev';
-        const u = encodeURIComponent(cfg.user);
-        let items = [];
-
-        // Простой фетч
-        const fetchPage = async (p) => {
-            const r = await fetch(`${worker}/?user=${u}&page=${p}`);
-            return r.json();
-        };
-
-        try {
-            if ((cfg.pages || 1) > 1) {
-                const reqs = [];
-                for(let i=1; i<=(cfg.pages||1); i++) reqs.push(fetchPage(i).catch(()=>({})));
-                const res = await Promise.all(reqs);
-                res.forEach(x => { if(x.items) items.push(...x.items); });
-            } else {
-                const r = await fetchPage(1);
-                items = r.items || [];
-            }
-        } catch(e) { throw e; }
-
-        // Нормализация для Lampa
-        return items.map(it => {
-            let poster = it.poster || it.poster_path;
-            if(poster && poster.startsWith('/')) poster = 'https://image.tmdb.org/t/p/w300' + poster;
+        rawItems.forEach(function(it) {
+            var tmdb = it.tmdb_id || it.tmdb || null;
+            var title = it.title || it.name;
+            var year = it.year || it.release_year || '0000';
             
-            return {
+            // Уникальность
+            var key = tmdb ? 'id_' + tmdb : 't_' + title;
+            if (seen.has(key)) return;
+            seen.add(key);
+
+            // Обработка постера
+            var poster = it.poster || it.poster_path || '';
+            if (poster && poster.startsWith('/')) {
+                poster = 'https://image.tmdb.org/t/p/w300' + poster;
+            }
+
+            var item = {
                 source: 'tmdb',
-                id: it.tmdb_id || it.tmdb,
-                title: it.title || it.name,
-                original_title: it.title,
-                release_date: (it.year || '0000') + '-01-01',
+                id: tmdb,
+                title: title,
+                original_title: title,
+                release_date: year + '-01-01',
                 poster_path: poster,
                 vote_average: 0
             };
-        });
-    }
-
-    function openSettings() {
-        const cfg = Settings.get();
-        Lampa.Input.edit({
-            title: 'Letterboxd Никнейм',
-            value: cfg.user,
-            free: true,
-            nosave: true
-        }, (val) => {
-            Settings.set({ ...cfg, user: val });
-            Lampa.Noty.show('Сохранено. Перезагрузка списка...');
             
-            // Триггер на обновление
-            const $ = Lampa.jQuery;
-            const container = $('#' + BLOCK_ID + ' .scroll__body');
-            if(container.length) renderContent(container, $);
+            cleanItems.push(item);
         });
+
+        // Сохраняем в кэш
+        Lampa.Storage.set(STORAGE_KEY, cleanItems);
+        
+        // Перерисовываем линию с новыми данными
+        renderLine(cleanItems);
     }
 
-    // --- ИНИЦИАЛИЗАЦИЯ ---
-    if (window.Lampa && window.Lampa.Listener && window.Lampa.jQuery) {
-        startPlugin();
-    } else {
-        // Ожидание загрузки ядра
-        const t = setInterval(() => {
-            if (window.Lampa && window.Lampa.Listener && window.Lampa.jQuery) {
-                clearInterval(t);
-                startPlugin();
+    // --- ОТРИСОВКА ЛИНИИ НА ГЛАВНОЙ ---
+
+    function renderLine(items) {
+        // Ищем активную вкладку и контейнер скролла
+        var active = $('.activity--active');
+        // Если мы не на главной, ничего не делаем, данные сохранятся в кэше
+        if (active.find('.head__title').text().toLowerCase() !== Lampa.Lang.translate('title_home').toLowerCase() && 
+            active.attr('id') !== 'main') {
+            return;
+        }
+
+        var scroll_body = active.find('.scroll__body').first();
+        if (!scroll_body.length) return;
+
+        var BLOCK_ID = 'lb-watchlist-row';
+        var line_container = $('#' + BLOCK_ID);
+
+        // Если линии нет - создаем
+        if (!line_container.length) {
+            var template = Lampa.Template.get('items_line', {
+                title: 'Letterboxd Watchlist'
+            });
+            template.attr('id', BLOCK_ID);
+
+            // Вставляем после первой линии (обычно меню или "Сейчас смотрят")
+            var first_line = scroll_body.find('.items-line').eq(0);
+            if (first_line.length) first_line.after(template);
+            else scroll_body.append(template);
+
+            line_container = template;
+        }
+
+        var body = line_container.find('.scroll__body');
+        body.empty();
+
+        // Рендер карточек
+        items.forEach(function(item) {
+            var card = new Lampa.Card(item, {
+                card_small: true,
+                object: item
+            });
+            card.create();
+            body.append(card.render());
+        });
+
+        // Важно: сообщаем контроллеру, что контент изменился, чтобы обновить навигацию
+        if (Lampa.Controller.enabled().name === 'content') {
+            Lampa.Controller.toggle('content');
+        }
+    }
+
+    // --- ИНТЕГРАЦИЯ В НАСТРОЙКИ (как в примере) ---
+
+    function addSettings() {
+        if (window.lb_settings_added) return;
+        window.lb_settings_added = true;
+
+        // Добавляем раздел в настройки
+        Lampa.SettingsApi.addComponent({
+            component: 'letterboxd',
+            name: 'Letterboxd',
+            icon: '<svg width="24px" height="24px" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>'
+        });
+
+        // Параметр: Никнейм
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: {
+                name: 'lb_user',
+                type: 'input'
+            },
+            field: {
+                name: 'Никнейм',
+                description: 'Ваш Username на Letterboxd (публичный)'
+            },
+            onChange: function(value) {
+                var cfg = getConfig();
+                cfg.user = value;
+                Lampa.Storage.set(CONFIG_KEY, cfg);
+                // Очищаем кэш при смене юзера
+                Lampa.Storage.set(STORAGE_KEY, []);
+                // Запускаем обновление
+                setTimeout(getWatchlist, 1000);
             }
-        }, 200);
+        });
+
+        // Параметр: Страницы
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: {
+                name: 'lb_pages',
+                type: 'select',
+                values: {
+                    1: '1 страница',
+                    2: '2 страницы',
+                    3: '3 страницы',
+                    5: '5 страниц'
+                },
+                default: 1
+            },
+            field: {
+                name: 'Глубина загрузки',
+                description: 'Сколько страниц списка загружать'
+            },
+            onChange: function(value) {
+                var cfg = getConfig();
+                cfg.pages = parseInt(value);
+                Lampa.Storage.set(CONFIG_KEY, cfg);
+            }
+        });
+
+        // Кнопка: Обновить
+        Lampa.SettingsApi.addParam({
+            component: 'letterboxd',
+            param: {
+                name: 'lb_refresh',
+                type: 'button'
+            },
+            field: {
+                name: 'Обновить список',
+                description: 'Принудительно загрузить данные'
+            },
+            onChange: function() {
+                Lampa.Storage.set(STORAGE_KEY, []); // сброс кэша
+                getWatchlist();
+                Lampa.Noty.show('Загрузка запущена...');
+            }
+        });
+        
+        // Принудительно выставляем значения из конфига в поля настроек
+        var currentCfg = getConfig();
+        Lampa.Storage.set('lb_user', currentCfg.user); 
+        Lampa.Storage.set('lb_pages', currentCfg.pages);
     }
 
+    // --- ЗАПУСК ---
+
+    function startPlugin() {
+        window.plugin_lb_ready = true;
+        
+        // 1. Добавляем настройки
+        addSettings();
+
+        // 2. Ловим событие перехода на главную
+        Lampa.Listener.follow('activity', function(e) {
+            if (e.type === 'active' && e.component === 'main') {
+                // Небольшая задержка, чтобы DOM построился
+                setTimeout(getWatchlist, 100);
+            }
+        });
+
+        // 3. Если плагин загрузился уже на главной - запускаем сразу
+        if (Lampa.Activity.active().component === 'main') {
+            getWatchlist();
+        }
+    }
+
+    if (!window.plugin_lb_ready) {
+        // Ждем готовности приложения, как в примере Кинопоиска
+        if (window.appready) startPlugin();
+        else {
+            Lampa.Listener.follow('app', function(e) {
+                if (e.type == 'ready') startPlugin();
+            });
+        }
+    }
 })();
