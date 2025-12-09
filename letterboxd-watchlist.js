@@ -22,15 +22,36 @@
         return {
             id: item.tmdb_id,
             title: item.title || '',
-            original_title: item.title || '',
+            original_title: item.original_title || item.title || '',
             overview: item.overview || '',
             poster_path: poster,
             backdrop_path: backdrop,
             vote_average: item.vote_average || 0,
-            release_date: item.year ? String(item.year) + '-01-01' : '',
+            release_date: item.tmdb_release_date || (item.year ? String(item.year) + '-01-01' : ''),
             media_type: 'movie',
             source: 'tmdb'
         };
+    }
+
+    /**
+     * Проверяет, вышел ли фильм (дата релиза <= сегодня)
+     */
+    function isReleased(item) {
+        var releaseDate = item.tmdb_release_date;
+        
+        if (!releaseDate) {
+            // Если нет точной даты, используем год
+            var year = parseInt(item.year, 10);
+            return !isNaN(year) && year <= new Date().getFullYear();
+        }
+        
+        var release = new Date(releaseDate);
+        var now = new Date();
+        
+        // Сбрасываем время для корректного сравнения только по дате
+        now.setHours(0, 0, 0, 0);
+        
+        return release <= now;
     }
 
     /**
@@ -52,16 +73,30 @@
         network.silent(url, function(data) {
             if (data && data.items && Array.isArray(data.items)) {
                 var results = [];
+                var skipped = 0;
                 
                 for (var i = 0; i < data.items.length; i++) {
                     try {
-                        results.push(transformToTMDBFormat(data.items[i]));
+                        var item = data.items[i];
+                        
+                        // Пропускаем фильмы, которые ещё не вышли
+                        if (!isReleased(item)) {
+                            console.log('Letterboxd', 'Skipping unreleased:', item.title, '(' + item.tmdb_release_date + ')');
+                            skipped++;
+                            continue;
+                        }
+                        
+                        results.push(transformToTMDBFormat(item));
                     } catch (e) {
                         console.log('Letterboxd', 'Error transforming item:', e);
                     }
                 }
                 
-                console.log('Letterboxd', 'Received ' + results.length + ' movies for user: ' + data.user);
+                if (skipped > 0) {
+                    console.log('Letterboxd', 'Skipped ' + skipped + ' unreleased movies');
+                }
+                
+                console.log('Letterboxd', 'Received ' + results.length + ' released movies for user: ' + data.user);
 
                 Lampa.Storage.set('letterboxd_movies', results);
                 Lampa.Storage.set('letterboxd_movies_count', data.count);
